@@ -1,0 +1,17 @@
+Package: TwoStageLRT
+Type: Package
+Title: Detection of Gene Expression Mid-parent Heterosis 
+Version: 0.1.0
+Author: Yunhui Qi
+Maintainer: Yunhui Qi <qyh@iastate.edu>
+Description: A two stage likelihood ratio test for detection of gene expression mid-parent heterosis from unreplicated multi-family RNA-seq experiments.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.1
+Depends: 
+    R (>= 2.10)
+Suggests: 
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
