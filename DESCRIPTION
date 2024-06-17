@@ -15,3 +15,5 @@ Suggests:
     knitr,
     rmarkdown
 VignetteBuilder: knitr
+URL: https://github.com/yunhuiqistat/TwoStageLRT
+BugReports: https://github.com/yunhuiqistat/TwoStageLRT/issues
