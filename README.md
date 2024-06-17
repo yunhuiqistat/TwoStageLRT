@@ -29,12 +29,12 @@ You can install the development version of TwoStageLRT like so:
 
 ``` r
 # install.packages("devtools")
-devtools::install_github("YunhuiQi/TwoStageLRT")
+devtools::install_github("yunhuiqistat/TwoStageLRT")
 ```
 
 ## Website
 
-Check the vignette at <https://yunhuiqi.github.io/TwoStageLRT/> .
+Check the vignette at <https://yunhuiqistat.github.io/TwoStageLRT/>.
 
 ## Usage
 
