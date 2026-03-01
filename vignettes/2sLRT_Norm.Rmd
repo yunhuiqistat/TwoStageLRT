@@ -1,0 +1,1737 @@
+---
+title: "2sLRT_Norm"
+author: "YunhuiQi"
+date: "2024-02-23"
+output: html_document
+---
+
+
+
+```{r import packages, message=FALSE}
+options(scipen=999)
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8) 
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(DESeq2)
+library(MASS)
+library(ggpubr)
+library(nleqslv)
+library(rootSolve)
+library(pracma)
+library(edgeR)
+library(ComplexHeatmap)
+library(pheatmap)
+library(plotly)
+library(cowplot)
+library(DescTools)
+```
+
+```{r, define functions}
+quant_vis <- function(df, quants=NULL){
+  if(is.null(quants)){quants <- seq(0, 1, 0.25)}
+  hybrid_quants <- apply(df, 2, quantile, probs = quants , na.rm = TRUE )
+  p <- t(hybrid_quants) %>% as.data.frame() %>% pivot_longer(cols = 1:length(quants), names_to = "Quantiles", values_to = "Value") %>% 
+  ggplot(aes(x = Value, color = Quantiles))+
+  geom_density()+
+  facet_wrap(vars(ifelse(Quantiles %in% c("0%","100%"), "Extreme", "Quantiles")), scale = "free")
+  return(p)
+}
+```
+
+## Real data mean expression level
+
+```{r read in real data counts, eval = TRUE}
+loc <- "/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/featurecounts.802samples.txt"
+
+hybrid_info <- read.table("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/lines_info.txt", header = T, sep="", fill = T )
+colnames(hybrid_info) <- c("hybrid","female","male")
+rownames(hybrid_info) <-hybrid_info$hybrid
+
+# check hybrids with reverse parents
+for(hb_num in 1:nrow(hybrid_info)){
+  mother <- hybrid_info$female[hb_num]
+  father <- hybrid_info$male[hb_num]
+  hybrid_info$sibling_num[hb_num] <- sum(hybrid_info$male == mother & hybrid_info$female == father)
+}
+
+dat <- read.table(loc, header = T, sep="", fill = T, check.names = FALSE)
+rownames(dat) <- dat$Geneid
+gene_length <- dat$Length
+dat <- dplyr::select(dat, -c(Length, Geneid))
+# check consistency of hybrids names
+length(intersect(hybrid_info$hybrid, colnames(dat))) == nrow(hybrid_info)
+length(intersect(hybrid_info$hybrid, colnames(dat))) + length(intersect(hybrid_info$female, colnames(dat))) + length(intersect(hybrid_info$male, colnames(dat))) - 
+length(intersect(hybrid_info$female, hybrid_info$male)) == ncol(dat)
+
+# parents dat, hybrids dat
+dat_parents <- dat[,unique(c(hybrid_info$female, hybrid_info$male))]
+rownames(dat_parents) <- rownames(dat)
+dat_hybrids <- dat[,hybrid_info$hybrid]
+rownames(dat_hybrids) <- rownames(dat)
+
+```
+
+```{r real data mean count visualization, eval=FALSE}
+# mean expression levels visualization
+parents_df <- data.frame(Genes =  rownames(dat_parents),
+                         Mean_count = apply(dat_parents, 1, mean),
+                         Var_count = apply(dat_parents, 1, var),
+                         Prop_zero = apply(dat_parents, 1, function(x){mean(x==0)}),
+                         Mean_log_count = apply(log(dat_parents + 1), 1, mean),
+                         Var_log_count = apply(log(dat_parents + 1), 1, var))
+ggplot(parents_df)+
+  geom_point(aes(x = Mean_count, y = Var_count))+
+  geom_abline(slope = 1, intercept = 0)+
+  labs(title = "Parents: mean_count vs var_count")
+ggplot(parents_df)+
+  geom_point(aes(x = Mean_log_count, y = Var_log_count))+
+  geom_abline(slope = 1, intercept = 0)+
+  labs(title = "Parents: mean_log_count vs var_log_count")
+quant_vis(t(dat_parents)) + labs(title = "Parents: gene quantiles at original scale")
+quant_vis(t(log(dat_parents + 1))) + labs(title = "Parents: gene quantiles at log scale")
+
+hybrids_df <- data.frame(Genes =  rownames(dat_hybrids),
+                         Mean_count = apply(dat_hybrids, 1, mean),
+                         Var_count = apply(dat_hybrids, 1, var),
+                         Prop_zero = apply(dat_hybrids, 1, function(x){mean(x==0)}),
+                         Mean_log_count = apply(log(dat_hybrids + 1), 1, mean),
+                         Var_log_count = apply(log(dat_hybrids + 1), 1, var))
+ggplot(hybrids_df)+
+  geom_point(aes(x = Mean_count, y = Var_count))+
+  geom_abline(slope = 1, intercept = 0)+
+  labs(title = "Hybrids: mean_count vs var_count")
+ggplot(hybrids_df)+
+  geom_point(aes(x = Mean_log_count, y = Var_log_count))+
+  geom_abline(slope = 1, intercept = 0)+
+  labs(title = "Hybrids: mean_log_count vs var_log_count")
+quant_vis(t(dat_hybrids)) + labs(title = "Hybrids: gene quantiles at original scale")
+quant_vis(t(log(dat_hybrids + 1))) + labs(title = "Hybrids: gene quantiles at log scale")
+```
+
+```{r real data familiy wise exploratory analysis, eval=FALSE}
+genes_sample <- sample(1:nrow(dat_hybrids), 1000, replace = FALSE)
+# fam_totalcounts <- matrix(NA, nrow = nrow(dat_hybrids), ncol = ncol(dat_hybrids))
+# fam_zerocounts <- matrix(NA, nrow = nrow(dat_hybrids), ncol = ncol(dat_hybrids))
+# fam_var <- matrix(NA, nrow = nrow(dat_hybrids), ncol = ncol(dat_hybrids))
+# MPH_ratio <- matrix(NA, nrow = nrow(dat_hybrids), ncol = ncol(dat_hybrids))
+# MPH <- matrix(NA, nrow = nrow(dat_hybrids), ncol = ncol(dat_hybrids))
+# for(hb_num in 1:nrow(hybrid_info)){
+#       female <- as.numeric(dat_parents[,hybrid_info$female[hb_num]])
+#       male <- as.numeric(dat_parents[,hybrid_info$male[hb_num]])
+#       hybrid <- as.numeric(dat_hybrids[,hybrid_info$hybrid[hb_num]])
+#       MPH[,hb_num] <- apply(cbind(female, male, hybrid), 1, function(x){(x[3]-mean(x[1:2]))})
+#       MPH_ratio[,hb_num] <- apply(cbind(female, male, hybrid), 1, function(x){(x[3]-mean(x[1:2]))/mean(x[1:2])})
+      # fam_totalcounts[,hb_num] <- apply(cbind(female, male, hybrid), 1, sum)
+      # fam_zerocounts[,hb_num] <- apply(cbind(female, male, hybrid), 1, function(x){sum(x==0)})
+      # fam_var[,hb_num] <- apply(cbind(female, male, hybrid), 1, var)
+# }
+# fam_dispMoM <- (fam_var-fam_totalcounts/3) / (fam_totalcounts/3)^2
+load("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/RealDataExploratory.RData")
+## heatmap of 1000 sampled genes
+print(Heatmap(fam_totalcounts[genes_sample,],
+              name = "Family Total Counts",
+              cluster_columns = FALSE,
+              cluster_rows = FALSE))
+print(Heatmap(fam_zerocounts[genes_sample,],
+              name = "Family Zero Counts",
+              cluster_columns = FALSE,
+              cluster_rows = FALSE))
+draw(Heatmap(fam_dispMoM[genes_sample,],
+             name = "Dispersion MoM",
+             heatmap_legend_param = list(legend_direction = "horizontal"), 
+             cluster_columns = FALSE,
+             cluster_rows = FALSE),
+     heatmap_legend_side = "bottom")
+MPH_ratio[is.infinite(MPH_ratio)] <- NA
+print(Heatmap(MPH_ratio[genes_sample,],
+              name = "Family (hyb-mp)/mp",
+              cluster_columns = FALSE,
+              cluster_rows = FALSE))
+print(Heatmap(MPH[genes_sample,],
+              name = "Family hyb-mp",
+              cluster_columns = FALSE,
+              cluster_rows = FALSE))
+gene_median_fam_zerocounts <- apply(fam_zerocounts, 1, median)
+gene_max_fam_zerocounts <- apply(fam_zerocounts, 1, max)
+plot(sort(gene_max_fam_zerocounts), ylab = "genewise max zero counts")
+gene_mean_fam_totalcounts <- apply(fam_totalcounts, 1, mean)
+plot(sort(gene_mean_fam_totalcounts), ylab = "genewise mean total family counts")
+abline(h = 20000)
+plot(sort(gene_mean_fam_totalcounts)[1:30000], ylab = "genewise mean total family counts",main="Genes 1:30000")
+plot(sort(gene_mean_fam_totalcounts)[30000:43000], ylab = "genewise mean total family counts",main="Genes 30000:43000")
+plot(sort(gene_mean_fam_totalcounts)[43001:43128], ylab = "genewise mean total family counts",main="Genes 43001:43128")
+hist(sort(gene_mean_fam_totalcounts)[1:30000], main="Hist of first 30000 genes")
+hist(sort(gene_mean_fam_totalcounts)[30000:43000], main="Hist of genes 30000:43000")
+hist(sort(gene_mean_fam_totalcounts)[43000:43128], main="Hist of genes 43000:43128")
+```
+
+
+
+
+
+## Heterosis Poisson LRT simulation (single family, single gene)
+
+```{r, function for conduct Poisson heterosis LRT}
+Hetero_Pois_LRT <- function(y_g1, y_g2, y_g3, C_1 = 1, C_2 = 2, C_3 = 1){
+  # This function conducts Poisson LRT test for heterosis in a single family and for a single gene with single replication per genotype
+  # Hg0: mu_g1 + mu_g2 = 2 * mu_g3
+  # @param y_g1: raw count for female
+  # @param y_g2: raw count for male
+  # @param y_g3: raw count for hybrid
+  # @param C_1: normalization factor for female sample
+  # @param C_2: normalization factor for male sample
+  # @param C_3: normalization factor for hybrid sample
+  
+  # 1. Get MLE under Hg0
+  if(C_1 > C_2){ # we solve mu_g2 first and then mu_g1
+    a <- C_1 - C_2
+    b <- 2*C_2 + C_3
+    A <- a*b
+    B <- b*(y_g1 + y_g2) - 2*a*(y_g2 + y_g3)
+    C <- -2*y_g1*y_g2 - 2*y_g2^2 - 2*y_g2*y_g3
+    # take the positive root
+    mu_g2_hat0 <- ifelse((-B+sqrt(B^2 - 4*A*C)) / (2*A) > 0,
+                         (-B+sqrt(B^2 - 4*A*C)) / (2*A) ,(-B-sqrt(B^2 - 4*A*C)) / (2*A))
+    mu_g1_hat0 <- y_g1*mu_g2_hat0 / (y_g2 + a*mu_g2_hat0)
+  }
+  else if(C_1 < C_2){ # we solve mu_g1 first and then mu_g2
+    a <- C_1 - C_2
+    b <- 2*C_1 + C_3
+    A <- a*b
+    B <- -b*(y_g1 + y_g2) - 2*a*(y_g1 + y_g3)
+    C <- 2*y_g1*y_g2 + 2*y_g1^2 + 2*y_g1*y_g3
+    # take the positive root
+    mu_g1_hat0 <- ifelse((-B-sqrt(B^2 - 4*A*C)) / (2*A) > 0,
+                         (-B-sqrt(B^2 - 4*A*C)) / (2*A), (-B+sqrt(B^2 - 4*A*C)) / (2*A))
+    mu_g2_hat0 <- y_g2*mu_g1_hat0 / (y_g1 - a*mu_g1_hat0)
+  }
+  else{ # when C_1 = C_2
+    # if y_g1 + y_g2 = 0, this means y_g1=y_g2=0, means numerators are all 0, thus y_g1+y_g2 in denominator replaced 1 does not affect the MLE of mu_g12 
+    mu_g1_hat0 <- 2*(y_g1^2 + y_g1*y_g2 + y_g1*y_g3) / ((2*C_1 + C_3)*ifelse(y_g1 + y_g2 == 0, 1, y_g1 + y_g2))
+    mu_g2_hat0 <- 2*(y_g2^2 + y_g1*y_g2 + y_g2*y_g3) / ((2*C_2 + C_3)*ifelse(y_g1 + y_g2 == 0, 1, y_g1 + y_g2))
+  }
+  
+  mu_g3_hat0 <- (mu_g1_hat0 + mu_g2_hat0) / 2
+  mu_g_hat0 <- c(mu_g1_hat0, mu_g2_hat0, mu_g3_hat0)
+  
+  # 2. Get MLE under Hg1
+  mu_g1_hat1 <- y_g1/C_1
+  mu_g2_hat1 <- y_g2/C_2
+  mu_g3_hat1 <- y_g3/C_3
+  mu_g_hat1 <- c(mu_g1_hat1, mu_g2_hat1, mu_g3_hat1)
+
+  # 3. Get test statistic
+  logL <- function(y_set, C_set, mu_set){
+    # if y_gi != 0, mu_gi != 0, for i=1,2,3
+    if(mu_set[1] == 0){first <- 0}
+    else{first <- y_set[1]*log(mu_set[1]) - C_set[1]*mu_set[1]}
+    if(mu_set[2] == 0){second <- 0 }
+    else{second <- y_set[2]*log(mu_set[2]) - C_set[2]*mu_set[2]}
+    if(mu_set[3] == 0){third <- 0}
+    else{third <- y_set[3]*log(mu_set[3]) - C_set[3]*mu_set[3]}
+    return(first + second + third)
+    #- log(factorial(y_set[1])) - log(factorial(y_set[2])) - log(factorial(y_set[3]))
+    #+ y_set[1]log(C_set[1]) + y_set[2]log(C_set[2]) + y_set[3]log(C_set[3]) 
+    # Since the factorial and ylogC terms will cancel even when y=0, but it can be infinity to make computation fail, so we omit them.
+  }
+  y_set = c(y_g1, y_g2, y_g3)
+  C_set = c(C_1, C_2, C_3)
+  LR <- -2 * (logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat0) - logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat1))
+  pval <- pchisq(LR, df = 1, lower.tail = FALSE)
+  # return(list(pval=pval, mu_g_hat0 = mu_g1_hat0, mu_g_hat1 = mu_g_hat1))
+  return(pval)
+}
+Hetero_Pois_Sim <- function(mu_g1, mu_g2, effect_factor, C_1, C_2, C_3, repetition_no = 1000, alpha = 0.05){
+  # This function conduct simulation to check the feasibility of poisson LRT for heterosis in single family for single gene
+  # the normalization factors are treated as known, since we do not have multiple genes, no way to normalize
+  # @param mu_g1: female mean count
+  # @param mu_g2: male mean count
+  # @param effect factor: how many times more mu_g3 is of mean of parents, 0 = Hg0
+  # @param C_1: normalization factor for female
+  # @param C_2: normalization factor for male
+  # @param C_3: normalization factor for hybrid
+  # @param repetition_no: the number of replications of this simulation
+  # @param alpha: significance level
+  
+  effect_size <- effect_factor * (mu_g1 + mu_g2) / 2
+  mu_g3 <- (mu_g1 + mu_g2) / 2 + effect_size 
+  pval <- c()
+  for (sim in 1:repetition_no) {
+    y_g1 <- rpois(1, C_1 * mu_g1)
+    y_g2 <- rpois(1, C_2 * mu_g2)
+    y_g3 <- rpois(1, C_3 * mu_g3)
+    # pval <- c(pval, Hetero_Pois_LRT(y_g1=y_g1, y_g2=y_g2, y_g3=y_g3, C_1=C_1, C_2=C_2, C_3=C_3)$pval)
+    pval <- c(pval, Hetero_Pois_LRT(y_g1=y_g1, y_g2=y_g2, y_g3=y_g3, C_1=C_1, C_2=C_2, C_3=C_3))
+  }
+  if(mean(is.na(pval))>0){
+    cat(paste("Proportion of failures among replications:", mean(is.na(pval)), "\n"))
+  }
+  return(mean(pval < alpha, na.rm = TRUE))
+}
+```
+
+```{r Poisson heterosis LRT single family single gene simulation, eval = FALSE}
+# Simulations 
+C_sim_set <- list(c(1.2,1.3,1.5), c(1.3,1.2,1.5), c(1.2, 1.2, 1.5), c(1.1, 1.1, 1.1), c(1, 1, 1))
+for (C_sim in C_sim_set) {
+  C_1 <- C_sim[1]
+  C_2 <- C_sim[2]
+  C_3 <- C_sim[3]
+  ## null - same mu_g1 and mu_g2, change value of common lambda
+  ## null - same mu_g1 and mu_g2, change alpha
+  ## null - different mu_g1 and mu_g2
+  sim_null_df <- data.frame(mu_g1 = c(10, 100, 500, 1000, rep(100, 4),             rep(100, 4)), 
+                            mu_g2 = c(10, 100, 500, 1000, rep(100, 4),             seq(200, 800, 200)),
+                            alpha = c(rep(0.05, 4),       c(0.01, 0.05, 0.1, 0.2), rep(0.05, 4)),
+                            effect_factor = 0)
+  for (n_case in 1:nrow(sim_null_df)) {
+    sim_null_df$rate[n_case] <- Hetero_Pois_Sim(mu_g1 = sim_null_df$mu_g1[n_case],
+                                                mu_g2 = sim_null_df$mu_g2[n_case],
+                                                effect_factor = sim_null_df$effect_factor[n_case],
+                                                C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                                alpha = sim_null_df$alpha[n_case])
+  }
+  
+  ## alternative - same mu_g1 and mu_g2, effect_factor = 2, change value of common mu_g
+  ## alternative - same mu_g1 and mu_g2, change effect_factor
+  ## alternative - different mu_g1 and mu_g2, effect_factor = 2 
+  sim_alt_df <- data.frame(mu_g1 = c(10, 100, 500, 1000, rep(10, 4),       rep(10, 4),      rep(10, 4)), 
+                           mu_g2 = c(10, 100, 500, 1000, rep(10, 4),       seq(20, 80, 20), seq(20, 80, 20)),
+                           effect_factor = c(rep(0.4, 4),seq(0.4, 1, 0.2), rep(1, 4),       seq(0.4, 1, 0.2)),
+                           alpha = 0.05)
+  
+  for (n_case in 1:nrow(sim_alt_df)) {
+    sim_alt_df$rate[n_case] <- Hetero_Pois_Sim(mu_g1 = sim_alt_df$mu_g1[n_case],
+                                               mu_g2 = sim_alt_df$mu_g2[n_case],
+                                               effect_factor = sim_alt_df$effect_factor[n_case],
+                                               C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                               alpha = sim_alt_df$alpha[n_case])
+  }
+  print(knitr::kable(sim_null_df, caption = paste0("Error rate with C = ", paste(C_sim, collapse = ","))))
+  print(knitr::kable(sim_alt_df, caption = paste0("Power with C = ", paste(C_sim, collapse = ","))))
+}
+```
+
+## Heterosis NB LRT with known dispersion simulation (single family, single gene)
+
+```{r, function for conduct NB LRT for given dispersion parameter}
+Hetero_NB_LRT <- function(y_g1, y_g2, y_g3, C_1 = 1, C_2 = 2, C_3 = 1, dispersion = 1){
+  # This function conducts NB LRT test for heterosis in a single family and for a single gene with single replication per genotype given dispersion parameter
+  # Hg0: mu_g1 + mu_g2 = 2 * mu_g3
+  # @param y_g1: raw count for female
+  # @param y_g2: raw count for male
+  # @param y_g3: raw count for hybrid
+  # @param C_1: normalization factor for female sample
+  # @param C_2: normalization factor for male sample
+  # @param C_3: normalization factor for hybrid sample
+  # @param dispersion: estimation of dispersion parameter
+  # @output pval: pvalue for NB LRT test with known dispersion
+  
+  # rate = 1/dispersion
+  if(dispersion == 0){return(NA)}
+  r <- 1/dispersion
+  
+  # 1. Get MLE under global
+  mu_g_hat1 <- c(y_g1/C_1, y_g2/C_2, y_g3/C_3)
+  
+  # 2. Get MLE under null
+  y_set <- c(y_g1, y_g2, y_g3)
+  C_set <- c(C_1, C_2, C_3)
+  if(sum(y_set) == 0){return(1)}
+  else{
+    equations <- function(mu_set) {
+      eq1 <- y_set[1]/mu_set[1] + y_set[3]/(mu_set[1]+mu_set[2]) - C_1*(r + y_set[1])/(C_1*mu_set[1] + r) - C_3*(r + y_set[3])/(C_3*(mu_set[1] + mu_set[2]) + 2*r)
+      eq2 <- y_set[2]/mu_set[2] + y_set[3]/(mu_set[1]+mu_set[2]) - C_2*(r + y_set[2])/(C_2*mu_set[2] + r) - C_3*(r + y_set[3])/(C_3*(mu_set[1] + mu_set[2]) + 2*r)
+      return(c(eq1, eq2))
+    }
+    
+    init_list <- list(c(ifelse(y_g1 == 0, 10, y_g1), ifelse(y_g2 == 0, 10, y_g2)),
+                      c(y_g1/C_1, y_g2/C_2), c(y_g1/2, y_g2/2),
+                      c(10, 10), c(100, 100), c(2, 2), c(100, 10), c(10, 100),
+                      c(100, 2), c(2, 100))
+
+    # function to check the validity of the solution
+    check_solution <- function(sol) {
+      all(sol$x >= 0) && all(sol$x <= max(c(y_g1, y_g2, y_g3)) * 100) && sol$termcd < 4
+    }
+    
+    # loop through the starting points to find a valid solution
+    sol_found <- FALSE
+    for (inits in init_list) {
+      solution <- nleqslv(x = inits, fn = equations, control = list(maxit = 500))
+      if (check_solution(solution)) {
+        mu_g_hat0 <- c(solution$x, mean(solution$x))
+        sol_found <- TRUE
+        break
+      }
+    }
+    
+    # if no solution is found with nleqslv, use multiroot
+    if (!sol_found) {
+      root <- multiroot(f = equations, start = c(ifelse(y_g1 == 0, 10, y_g1/C_1), ifelse(y_g2 == 0, 10, y_g2/C_2)))
+      if (all(root$root >= 0) && all(root$root <= max(c(y_g1, y_g2, y_g3)) * 100)) {
+        mu_g_hat0 <- c(root$root, mean(root$root))
+      } 
+      else {
+        return(NA) # Or handle the failure to find a solution as appropriate
+      }
+    }
+
+    logL <- function(y_set, C_set, mu_set, r){
+      # under H1, if y_gi!=0, mu_gi!=0, under H0, its very rare to get 0 as MLE
+      if(mu_set[1] == 0){first <- -(r + y_set[1])*log(r + C_set[1]*mu_set[1])}
+      else{first <- y_set[1]*log(mu_set[1]) - (r + y_set[1])*log(r + C_set[1]*mu_set[1])}
+      if(mu_set[2] == 0){second <- -(r + y_set[2])*log(r + C_set[2]*mu_set[2])}
+      else{second <- y_set[2]*log(mu_set[2]) - (r + y_set[2])*log(r + C_set[2]*mu_set[2])}
+      if(mu_set[3] == 0){third <- -(r + y_set[3])*log(r + C_set[3]*mu_set[3])}
+      else{third <- y_set[3]*log(mu_set[3]) - (r + y_set[3])*log(r + C_set[3]*mu_set[3])}
+      return(first + second + third)
+      # Since the choose terms and rlogr and ylogC terms will cancel even with y=0, but it can be greater than the computation can afford  to make computation fail, so we omit them right now
+  }
+  LR <- -2 * (logL(y_set=y_set, C_set = C_set, mu_set = mu_g_hat0, r=r) - logL(y_set=y_set, C_set = C_set, mu_set = mu_g_hat1, r=r))
+  pval <- pchisq(LR, df = 1, lower.tail = FALSE)
+  # return(list(pval=pval, mu_g_hat0 = mu_g1_hat0, mu_g_hat1 = mu_g_hat1))
+  return(pval)
+  }
+}
+
+Hetero_NB_Sim <- function(mu_g1, mu_g2, effect_factor, C_1, C_2, C_3, dispersion, repetition_no = 1000, alpha = 0.05){
+  # This function conduct simulation to check the feasibility of NB LRT for heterosis in single family for single gene given dispersion parameter
+  # the normalization factors and dispersion parameter are treated as known in the test
+  # @param mu_g1: female mean count
+  # @param mu_g2: male mean count
+  # @param effect factor: how many times more mu_g3 is of mean of parents, 0 = Hg0
+  # @param C_1: normalization factor for female
+  # @param C_2: normalization factor for male
+  # @param C_3: normalization factor for hybrid
+  # @param dispersion: dispersion parameter for NB distribution
+  # @param repetition_no: the number of replications of this simulation
+  # @param alpha: significance level
+  
+  effect_size <- effect_factor * (mu_g1 + mu_g2) / 2
+  mu_g3 <- (mu_g1 + mu_g2) / 2 + effect_size 
+  pval <- c()
+  for (sim in 1:repetition_no) {
+    y_g1 <- rnegbin(1, mu = C_1 * mu_g1, theta = 1/dispersion)
+    y_g2 <- rnegbin(1, mu = C_2 * mu_g2, theta = 1/dispersion)
+    y_g3 <- rnegbin(1, mu = C_3 * mu_g3, theta = 1/dispersion)
+    # pval <- c(pval, Hetero_NB_LRT(y_g1 = y_g1, y_g2 = y_g2, y_g3 = y_g3, 
+    #                               C_1 = C_1, C_2 = C_2, C_3 = C_3,
+    #                               dispersion = dispersion)$pval)
+    pval <- c(pval, Hetero_NB_LRT(y_g1 = y_g1, y_g2 = y_g2, y_g3 = y_g3, 
+                                  C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                  dispersion = dispersion))
+  }
+  if(mean(is.na(pval))>0){
+    cat(paste("Proportion of failures among replications:", mean(is.na(pval)), "\n"))
+  }
+  return(mean(pval < alpha, na.rm = TRUE))
+}
+```
+
+```{r NB heterosis LRT single family single gene simulation, eval = FALSE}
+# Simulations 
+C_sim_set <- list(c(1.2,1.3,1.5), c(1.3,1.2,1.5), c(1.2, 1.2, 1.5), c(1.1, 1.1, 1.1), c(1, 1, 1))
+for (C_sim in C_sim_set) {
+  C_1 <- C_sim[1]
+  C_2 <- C_sim[2]
+  C_3 <- C_sim[3]
+## null - same mu_g1 and mu_g2, change value of common lambda
+## null - same mu_g1 and mu_g2, change alpha
+## null - different mu_g1 and mu_g2
+## null - same mu_g1 and mu_g2, same alpha, change dispersion 
+sim_null_df <- data.frame(mu_g1 = c(10, 100, 500, rep(100, 3), rep(100, 3), rep(100, 3)),       
+                          mu_g2 = c(10, 100, 500, rep(100, 3), seq(200, 400, 100), rep(100, 3)), 
+                          alpha = c(rep(0.05, 3), c(0.01, 0.05, 0.1), rep(0.05, 3), rep(0.05, 3)),
+                          dispersion = c(rep(0.1, 3), rep(0.1, 3), rep(0.1, 3), c(0.2, 0.3, 0.4)),
+                          effect_factor = 0,
+                          rate = NA)
+for (n_case in 1:nrow(sim_null_df)) {
+  sim_null_df$rate[n_case] <- Hetero_NB_Sim(mu_g1 = sim_null_df$mu_g1[n_case],
+                                            mu_g2 = sim_null_df$mu_g2[n_case],
+                                            effect_factor = sim_null_df$effect_factor[n_case],
+                                            C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                            alpha = sim_null_df$alpha[n_case],
+                                            dispersion = sim_null_df$dispersion[n_case],
+                                            repetition_no = 1000)
+}
+
+## alternative - same mu_g1 and mu_g2, effect_factor = 0.4, change value of common lambda
+## alternative - same mu_g1 and mu_g2, change effect_factor
+## alternative - different mu_g1 and mu_g2, effect_factor = 0.4 
+## alternative - same mu_g1 and mu_g2, effect_factor = 0.4, change value of dispersion
+sim_alt_df <- data.frame(mu_g1 = c(10, 100, 500, rep(100, 3), rep(100, 3), rep(100, 3)),       
+                         mu_g2 = c(10, 100, 500, rep(100, 3), seq(200, 400, 100), rep(100, 3)), 
+                         alpha = 0.05,
+                         dispersion = c(rep(0.1, 3), rep(0.1, 3), rep(0.1, 3), c(0.2, 0.3, 0.4)),
+                         effect_factor = c(rep(2, 3), c(2, 4, 6), rep(2, 3), rep(2, 3)),
+                         rate = NA)
+for (n_case in 1:nrow(sim_alt_df)) {
+  sim_alt_df$rate[n_case] <-Hetero_NB_Sim(mu_g1 = sim_alt_df$mu_g1[n_case],
+                                          mu_g2 = sim_alt_df$mu_g2[n_case],
+                                          effect_factor = sim_alt_df$effect_factor[n_case],
+                                          C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                          alpha = sim_alt_df$alpha[n_case],
+                                          dispersion = sim_alt_df$dispersion[n_case],
+                                          repetition_no = 1000)
+}
+  print(knitr::kable(sim_null_df, caption = paste0("Error rate with C = ", paste(C_sim, collapse = ","))))
+  print(knitr::kable(sim_alt_df, caption = paste0("Power with C = ", paste(C_sim, collapse = ","))))
+}
+```
+
+## Equal family Poisson LRT simulation (single family, single gene)
+
+```{r, function for conduct Poisson three mean comparison LRT}
+Pois_3mean_LRT <- function(y_g1, y_g2, y_g3, C_1 = 1, C_2 = 1, C_3 = 1){
+  # This function conducts Poisson LRT test for non-family in a single family and for a single gene with single replication per genotype
+  # Hg0: mu_g1 = mu_g2 = mu_g3
+  # @param y_g1: raw count for female
+  # @param y_g2: raw count for male
+  # @param y_g3: raw count for hybrid
+  # @param C_1: normalization factor for female sample
+  # @param C_2: normalization factor for male sample
+  # @param C_3: normalization factor for hybrid sample
+  
+  y_set <- c(y_g1, y_g2, y_g3)
+  C_set <- c(C_1, C_2, C_3)
+  mu_g_hat0 <- c(sum(y_set)/sum(C_set), sum(y_set)/sum(C_set), sum(y_set)/sum(C_set))
+  mu_g_hat1 <- c(y_g1/C_1, y_g2/C_2, y_g3/C_3)
+  logL <- function(y_set, C_set, mu_set){
+    # if y_gi != 0, mu_gi != 0, for i=1,2,3
+    if(mu_set[1] == 0){first <- 0}
+    else{first <- y_set[1]*log(mu_set[1]) - C_set[1]*mu_set[1]}
+    if(mu_set[2] == 0){second <- 0 }
+    else{second <- y_set[2]*log(mu_set[2]) - C_set[2]*mu_set[2]}
+    if(mu_set[3] == 0){third <- 0}
+    else{third <- y_set[3]*log(mu_set[3]) - C_set[3]*mu_set[3]}
+    return(first + second + third)
+    #- log(factorial(y_set[1])) - log(factorial(y_set[2])) - log(factorial(y_set[3]))
+    #+ y_set[1]log(C_set[1]) + y_set[2]log(C_set[2]) + y_set[3]log(C_set[3]) 
+    # Since the factorial and ylogC terms will cancel even when y=0, but it can be infinity to make computation fail, so we omit them.
+  }
+  LR <- -2 * (logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat0) - logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat1))
+  pval <- pchisq(LR, df = 2, lower.tail = FALSE)
+  # return(list(pval=pval, mu_g_hat0 = mu_g1_hat0, mu_g_hat1 = mu_g_hat1))
+  return(pval)
+}
+
+Pois_3mean_Sim <- function(mu_g1, mu_g2, mu_g3, C_1, C_2, C_3, repetition_no = 1000, alpha = 0.05){
+   # This function conduct simulation to check the feasibility of Poisson LRT for non-family in single family for single gene given dispersion parameter, the normalization factors are treated as known in the test
+  # @param mu_g1: female mean count
+  # @param mu_g2: male mean count
+  # @param mu_g3: hybrid mean count
+  # @param C_1: normalization factor for female
+  # @param C_2: normalization factor for male
+  # @param C_3: normalization factor for hybrid
+  # @param repetition_no: the number of replications of this simulation
+  # @param alpha: significance level
+
+  pval <- c()
+  for (sim in 1:repetition_no) {
+    y_g1 <- rpois(1, C_1 * mu_g1)
+    y_g2 <- rpois(1, C_2 * mu_g2)
+    y_g3 <- rpois(1, C_3 * mu_g3)
+    # pval <- c(pval, Pois_3mean_LRT(y_g1 = y_g1, y_g2 = y_g2, y_g3 = y_g3, 
+                                   # C_1 = C_1, C_2 = C_2, C_3 = C_3)$pval)
+    pval <- c(pval, Pois_3mean_LRT(y_g1 = y_g1, y_g2 = y_g2, y_g3 = y_g3, 
+                                   C_1 = C_1, C_2 = C_2, C_3 = C_3))
+  }
+  return(mean(pval < alpha, na.rm = TRUE))
+}
+```
+
+
+```{r three equal parents simple version simulation, eval = FALSE}
+# Simulations 
+C_sim_set <- list(c(1.2,1.3,1.5), c(1.3,1.2,1.5), c(1.2, 1.2, 1.5), c(1.1, 1.1, 1.1), c(1, 1, 1))
+for (C_sim in C_sim_set) {
+  C_1 <- C_sim[1]
+  C_2 <- C_sim[2]
+  C_3 <- C_sim[3]
+  ## null - change value of common lambda
+  ## null - change alpha
+  sim_null_df <- data.frame(mu_g1 = c(10, 100, 500, 1000, rep(100, 4)), 
+                            mu_g2 = c(10, 100, 500, 1000, rep(100, 4)), 
+                            mu_g3 = c(10, 100, 500, 1000, rep(100, 4)), 
+                            alpha = c(rep(0.05, 4),c(0.01, 0.05, 0.1, 0.2)))
+  for (n_case in 1:nrow(sim_null_df)) {
+    sim_null_df$rate[n_case] <- Pois_3mean_Sim(mu_g1 = sim_null_df$mu_g1[n_case],
+                                               mu_g2 = sim_null_df$mu_g2[n_case],
+                                               mu_g3 = sim_null_df$mu_g3[n_case],
+                                               C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                               alpha = sim_null_df$alpha[n_case])
+  }
+  
+  ## alternative - change value of mu_g1, 2, 3, but mu_g3 = 2mu_g2 = 2mu_g1
+  ## alternative - same mu_g1, change effect_factor
+  sim_alt_df <- data.frame(mu_g1 = c(10, 100, 500, 1000, rep(100, 4)),
+                           mu_g2 = c(10, 100, 500, 1000, rep(100, 4)),
+                           mu_g3 = c(2*10, 2*100, 2*500, 2*1000, c(200, 300, 400, 500)),
+                           alpha = 0.05)
+  
+  for (n_case in 1:nrow(sim_alt_df)) {
+    sim_alt_df$rate[n_case] <- Pois_3mean_Sim(mu_g1 = sim_alt_df$mu_g1[n_case],
+                                           mu_g2 = sim_alt_df$mu_g2[n_case],
+                                           mu_g3 = sim_alt_df$mu_g3[n_case],
+                                           C_1 = C_1, C_2 = C_2, C_3 = C_3,
+                                           alpha = sim_alt_df$alpha[n_case])
+  }
+  print(knitr::kable(sim_null_df, caption = paste0("Error rate with C = ", paste(C_sim, collapse = ","))))
+  print(knitr::kable(sim_alt_df, caption = paste0("Power with C = ", paste(C_sim, collapse = ","))))
+}
+```
+
+
+## NB dispersion estimation simulation using all-null family (multi family, multi gene)
+```{r,  function for estimating NB dispersion for multiple equal means family}
+Disp_est_null_family <- function(counts, group = NULL){
+  # This function estimate the tagwise dispersion parameter for multiple genes with multiple family
+  # @param counts: with genes in rows, and three*n_families columns, female, male and hybrid which passed non-family LRT
+  # @param group: a vector indicating the group information of three*n_families columns
+  if(is.null(group)){
+    y <- DGEList(counts = counts)
+    y <- calcNormFactors(y, method = "RLE")
+    y <- estimateCommonDisp(y)
+    y <- estimateTrendedDisp(y)
+    y <- estimateTagwiseDisp(y)
+  }
+  else{
+    y <- DGEList(counts = counts, group = group) 
+    y <- calcNormFactors(y, method = "RLE")
+    design <- model.matrix(~ group)
+    y <- estimateGLMCommonDisp(y, design)
+    y <- estimateGLMTrendedDisp(y, design)
+    y <- estimateGLMTagwiseDisp(y, design)
+  }
+    return(y$tagwise.dispersion)
+  }
+```
+
+
+## Two stage LRT full version simulation (multiple families, multiple genes) 
+```{r, 2sLRT}
+twoStageLRT <- function(hybrid_mat, female_mat, male_mat, disp_mat = NULL,
+                        normalization = FALSE, norm_factors = NULL,
+                        n_fam_thres = 20, gene_groups_no = 3){
+  # This function apply two stage LRT to data with formats: three count matrices with genes in rows, samples in columns
+  # @param hybrid_mat: hybrids expression count with genes in rows, samples in columns.
+  # @param female_mat: female expression count with genes in rows, samples in columns.
+  # @param male_mat: male expression count with genes in rows, samples in columns.
+  # @param disp_mat: If "Pois", use Pois LRT and only output Pois results
+  #                  if NULL, use dispersion estimation, else, use provided disp_mat for NB test, but output will have both NBLRT and PoisLRT results
+  # @param normalization: whether or not need normalization for the raw data matrices, 
+  #                       if FALSE, treat the normalization factors all 1.
+  # @param norm_factors: if normalization = TRUE and norm_factors = NULL, use DESeq normalization factors,
+  #                      if normalization = TRUE and norm_factors is a list contains three vectors 
+  #                      female, male and hybrid normalization factors, use the provided norm_factors in tests
+  # @param n_fam_thres: genes with at least n_fam_thres null families will be used for dispersion estimation, 
+  #                     otherwise, will use loess prediction to get dispersion, default is 20
+  # @param gene_groups_no: the number of clusters for genes, default is 3.
+  # @output: if disp_mat = NULL, return Poisson LRT for heterosis pvalue and qvalue from BH adjustment
+  #          if disp_mat != NULL, return both NB and Poisson LRT for heterosis pvalue and qvalue and genewise dispersion.
+  #          and the estimation of mu_gi, which is the female/male/hybrid_mat_normed
+
+  n_family <- ncol(hybrid_mat)
+  n_gene <- nrow(hybrid_mat)
+  
+  ##### Step 1: Determine normalization ####
+  if(normalization & is.null(norm_factors)){ # use DESeq normalization
+    cat("Use DESeq estimated normalization factors. \n")
+    data <- cbind(female_mat, male_mat, hybrid_mat)
+    DGE <- DESeqDataSetFromMatrix(countData = data, 
+                                  colData = data.frame(sample = 1:ncol(data)),
+                                  design = model.matrix(~c(1:ncol(data))))
+    DGE <- estimateSizeFactors(DGE)
+    dat_normed <- DESeq2::counts(DGE, normalized = T) # this can serve as the MLE of mu_gi under global/Hg1, just y_gi/C_i
+    female_mat_normed <- dat_normed[,1:n_family]
+    male_mat_normed <- dat_normed[,(n_family+1):(2*n_family)]
+    hybrid_mat_normed <- dat_normed[,(2*n_family+1):(3*n_family)]
+    norm_factors <- list(female_norm_factor = DGE$sizeFactor[1:n_family],
+                         male_norm_factor = DGE$sizeFactor[(n_family+1):(2*n_family)],
+                         hybrid_norm_factor = DGE$sizeFactor[(2*n_family+1):(3*n_family)])
+    
+  }
+  else if(normalization & (!is.null(norm_factors))){
+    cat("Use provided normalization factors, no estimation. \n")
+    female_mat_normed <- sweep(female_mat, 2, norm_factors$female_norm_factor, "/")
+    male_mat_normed <- sweep(male_mat, 2, norm_factors$male_norm_factor, "/")
+    hybrid_mat_normed <- sweep(hybrid_mat, 2, norm_factors$hybrid_norm_factor, "/")
+  }
+  else{ # when normalization is FALSE, all norm_factors will be set to be 1
+    cat("Use all 1 normalization factors, no normalization. \n")
+    norm_factors <- list(female_norm_factor = rep(1, n_family),
+                         male_norm_factor = rep(1, n_family),
+                         hybrid_norm_factor = rep(1, n_family))
+    female_mat_normed <- female_mat
+    male_mat_normed <- male_mat
+    hybrid_mat_normed <- hybrid_mat
+  }
+  
+  # from sample-wise normalization factors to a matrix for matrix computation, each column has the same normalization factor
+  female_norm_factor_mat <- matrix(norm_factors$female_norm_factor, nrow = n_gene, ncol = n_family, byrow = TRUE)
+  male_norm_factor_mat <- matrix(norm_factors$male_norm_factor, nrow = n_gene, ncol = n_family, byrow = TRUE)
+  hybrid_norm_factor_mat <- matrix(norm_factors$hybrid_norm_factor, nrow = n_gene, ncol = n_family, byrow = TRUE)  
+  
+  # Poisson LRT for heterosis
+  pval_Pois <- matrix(mapply(Hetero_Pois_LRT, female_mat, male_mat, hybrid_mat,
+                          female_norm_factor_mat, male_norm_factor_mat, hybrid_norm_factor_mat), 
+                   nrow = n_gene, ncol = n_family)
+  rownames(pval_Pois) <- rownames(hybrid_mat)
+  colnames(pval_Pois) <- colnames(hybrid_mat)
+  qval_Pois <- apply(pval_Pois, 2, function(x){p.adjust(x, method = "fdr")})
+  
+  
+  ##### Step 2: Gene-wise pre-test - Poisson null family LRT ####
+  # compute mid-parent (mu_g1+mu_g2)/2 globally, so the estimation are (y_g1/C_1 + y_g2/C2)/2
+  MP <- (female_mat_normed + male_mat_normed) / 2
+  rownames(MP) <-  rownames(hybrid_mat)
+  colnames(MP) <- colnames(hybrid_mat)
+  
+  # note: all the input should be raw count matrices and the normalization factor matrices
+  pval_family <- matrix(mapply(Pois_3mean_LRT, female_mat, male_mat, hybrid_mat, 
+                               female_norm_factor_mat, male_norm_factor_mat, hybrid_norm_factor_mat), 
+                        nrow = n_gene, ncol = n_family)
+  rownames(pval_family) <- rownames(hybrid_mat)
+  colnames(pval_family) <-colnames(hybrid_mat)
+  qval_family <- apply(pval_family, 2, function(x){p.adjust(x, method = "fdr")})
+  
+  
+  if(is.null(disp_mat)){
+    ##### Step 3: Estimate dispersion matrix ####
+    null_disp_ind <- qval_family > 0.05 # default is 0.05, change to 0.1 in our real data application
+    # SS1: for the binary matrix, use hclust with jaccard dist to group genes together and use the noull families for the worst gene as group to estimate tagwise dispersion.
+    DISP <- rep(NA, nrow(null_disp_ind)) # each gene will only have one dispersion estimation
+    names(DISP) <- rownames(null_disp_ind)
+    null_disp_ind_sub <- null_disp_ind[apply(null_disp_ind, 1, function(x) sum(x == 1)) >= n_fam_thres,] # keep genes with n_null_fam > n_fam_thres for clustering
+    jacc_clust <- cutree(hclust(dist(null_disp_ind_sub, "binary")), gene_groups_no)
+    cat("Gene clusters size: \n")
+    print(table(jacc_clust))
+    for (i_clust in unique(jacc_clust)) { # for each cluster, find the worst gene, use its null families as groups for dispersion estimation
+      genes_clust <- rownames(null_disp_ind_sub)[jacc_clust == i_clust]
+      ind_clust <- null_disp_ind_sub[genes_clust,]
+      worst_gene <- genes_clust[which.max(apply(ind_clust, 1, function(x) sum(x==0)))]
+      families_clust <- colnames(null_disp_ind_sub)[null_disp_ind_sub[worst_gene,] == 1]
+      cat(paste("Dispersion estimation for cluster", i_clust, "the number of families is", length(families_clust),", number of genes is ", length(genes_clust)," \n"))
+      counts_clust <- matrix(NA, nrow = length(genes_clust), ncol = 3 * length(families_clust))
+      for(n_hybrid in 1:length(families_clust)){
+        counts_clust[,(n_hybrid - 1) * 3 + 1] <- female_mat[genes_clust, families_clust[n_hybrid]]
+        counts_clust[,(n_hybrid - 1) * 3 + 2] <- male_mat[genes_clust, families_clust[n_hybrid]]
+        counts_clust[,(n_hybrid - 1) * 3 + 3] <- hybrid_mat[genes_clust, families_clust[n_hybrid]]
+      }
+      group_clust <- rep(paste("G",1:length(families_clust), sep = ""), each = 3)
+      # input raw counts and the edgeR will use RLE method before estimation of dispersion
+      DISP[genes_clust] <- Disp_est_null_family(counts = counts_clust, group = group_clust) # include raw counts and groups, RLE=DESeq will be applied before estimation of dispersion parameters within this function
+    }
+    cat("Dispersion estimation summary:\n")
+    print(summary(DISP))
+
+    #SS2: fit a loess curve to predict the dispersions for genes whose number of all-null families do not reach the minimal requirement 
+    loess_x <- apply(MP, 1, median)
+    x <- loess_x[!is.na(DISP)]
+    y <- DISP[!is.na(DISP)]
+    if(sd(x) > 0){
+      new_x <- loess_x[is.na(DISP)]
+      loess_fit <- loess(y~x, span = 0.5) # default is 0.5, change to 0.1 in our real data application
+      pred_disp <- predict(loess_fit, newdata = new_x)
+      pred_disp[pred_disp < 0] <- 0
+      intra <- new_x[!is.na(pred_disp) & pred_disp > 0]
+      intra_disp <- pred_disp[!is.na(pred_disp) & pred_disp > 0]
+      extra <- new_x[is.na(pred_disp) | pred_disp <= 0]
+      extra_disp <- ifelse(extra < min(x), y[which.min(x)], y[which.max(x)])
+      pred_disp[is.na(pred_disp) | pred_disp <= 0] <- extra_disp
+      DISP[is.na(DISP)] <- pred_disp
+      }
+    dispersion_mat <- matrix(DISP, nrow = n_gene, ncol = n_family)
+    # visualization of single dataset dispersion estimation vs MP 
+    p_single_disp_vis <- ggplot()+
+      geom_point(data=data.frame(x=x, y=y),aes(x=x, y=y), color = "black") +
+      geom_point(data=data.frame(x=intra, y=intra_disp), aes(x=x, y=y), color="green")+
+      geom_point(data=data.frame(x=extra, y=extra_disp), aes(x=x, y=y), color="blue")+
+      geom_line(data=data.frame(x=x, y=loess_fit$fitted),aes(x=x, y=y), color = "red") +
+      labs(title = "Single Dataset: Estimated(black), Fitted(red), \n Predicted(green), Extrapolation(blue)", x="MP", y="Dispersion") 
+  }
+  else if(! "character" %in% class(disp_mat)){ # use provided dispersion parameters
+    dispersion_mat <- disp_mat
+    }
+  else{ # use Poisson LRT for MPH
+    cat("Output is from Poisson LRT for heterosis. \n")
+    return(list(pval_Pois = pval_Pois, qval_Pois = qval_Pois, 
+                pval_NB = NULL, qval_NB = NULL, DISP = 0,
+                female_mat_normed = NULL, male_mat_normed = NULL,
+                hybrid_mat_normed = NULL, p_single_disp_vis = NULL))
+  }
+  
+  ##### Step 4: NB estimation with known dispersion matrix ####
+  cat("Output is from NB LRT for heterosis. \n")
+  pval_NB <- matrix(mapply(Hetero_NB_LRT, female_mat, male_mat, hybrid_mat, 
+                           female_norm_factor_mat, male_norm_factor_mat, hybrid_norm_factor_mat,
+                           dispersion_mat), nrow = n_gene, ncol = n_family)
+  rownames(pval_NB) <- rownames(hybrid_mat)
+  colnames(pval_NB) <- colnames(hybrid_mat)
+  qval_NB <- apply(pval_NB, 2, function(x){p.adjust(x, method = "fdr")})
+  return(list(pval_NB = pval_NB, qval_NB = qval_NB, DISP = dispersion_mat[,1],
+              pval_Pois = pval_Pois, qval_Pois = qval_Pois,
+              female_mat_normed = female_mat_normed, male_mat_normed = male_mat_normed,
+              hybrid_mat_normed = hybrid_mat_normed, p_single_disp_vis = p_single_disp_vis))
+}
+
+Heter_pip_2sLRT <- function(n_genes, n_families,
+                            mu_female, mu_male, effect_factor,
+                            female_norm_factor, male_norm_factor, hybrid_norm_factor, true_norm = c(TRUE, FALSE),
+                            MP_DISP_func, true_disp = c("None", TRUE, FALSE), 
+                            n_fam_thres = 20, gene_groups_no = 3, repetition = 150, 
+                            plot = TRUE, filename = NULL){
+  # This function simulates n_families with each family includes three counts (i=1-female, 2-male, 3-hybrid) from Negative Binomial distribution for n_genes. Then two stage LRT is applied to check heterosis gene-family combination 
+  # G genes (specify) with normalization factors C_i, mean mu_{gi} and dispersion parameter phi_g for each family.
+  # Hg0: mu_{g1} + mu_{g2} = 2mu_{g3} gene g is non heterosis in this family.
+  # Hg1: otherwise. The effect size under alternative is specified by effect factor - how many times more mu_g3 is of (mu_g1 + mu_g2) / 2, 0 = Hg0
+  # @param n_genes: number of genes.
+  # @param n_families: number of families.
+  # @param female_norm_factor: a vector with normalization factors for n_families females.
+  # @param hybrid_norm_factor: a vector with normalization factors for n_families males.
+  # @param male_norm_factor: a vector with normalization factors for n_families hybrids.
+  #         if norm_factor == NULL, norm_factor will be all 1.
+  #         if provided and are not all 1, DESeq normalization factors will be used in 2sLRT test.
+  #         if provided with length = 2, norm_factor will be simulated from Unif(norm_factor[1], norm_factor[2]), DESeq will also be used.
+  #         if provided with length = 1, all samples share the same normalization factor, DESeq will not be used.
+  # @param MP_DISP_func: character name of function describing the relationship between mid-parent and dispersion parameters.
+  # @param mu_female: a matrix containing mean expression count of female samples for all genes and all families with nrow = n_genes, ncol = n_families.
+  # @param mu_male: a matrix containing mean count of male samples for n_genes and n_families.
+  #         if a vector with length = 2, mean mu (not Cmu) for all genes and all families in male sample will be simulated from Gamma(mu_male[1], mu_male[2]) for shape and rate, thus the mean of gamma distribution is shape/rate.
+  #         if a vector with length = 1, all male samples share the same mean count.
+  # @param effect_factor: a matrix containing how many times more mu_{g3} is of 
+  #         (mu_{g1} + mu_{g2})/2, for null cases, set it to be 0. 
+  #         if a vector with length = 1, all families share the same effect size.
+  # @param true_disp: "None" for Pois LRT, TRUE for NB LRT with true disp, FALSE for NB LRT with estimated disp.
+  # @param true_norm: TRUE for using true C_i in tests, FALSE for using DESeq normalization factors in tests
+  # @param n_fam_thres: genes with at least n_fam_thres all-null families will be used for dispersion estimation, otherwise, will use loess prediction to get dispersion, default is 20
+  # @param gene_groups_no: the number of clusters for genes, default is 3.
+  # @param repetition: the number of replications for simulation
+  # @param filename: if NULL, no save of any plots, if specified, means on slurm running, will save plots.
+  # @output: a list including pvalue matrix and qvalue matrix (computed using BH method).
+  
+  
+  
+  # mu_female: n_genes * n_families
+  if(length(mu_female) == 1){
+    cat("All genes and families have the same mean female count.\n")
+    mu_female <- matrix(mu_female, nrow = n_genes, ncol = n_families)}
+  else if(length(mu_female) == 2){
+    cat("Use simulated mean count from gamma with shape and rate for female. \n")
+    mu_female <- matrix(rgamma(n_genes * n_families, shape = mu_female[1], rate = mu_female[2]), nrow = n_genes, byrow = T)}
+  else if(nrow(mu_female) == n_genes & ncol(mu_female) == n_families){
+    cat("Use provided mean count matrix for female. \n")}
+  else{cat("Error: mu_female must be a matrix or a vector of length 2. \n")}
+  
+  # mu_male: n_genes * n_families
+  if(length(mu_male) == 1){
+    cat("All genes and families have the same mean male count. \n")
+    mu_male <- matrix(mu_male, nrow = n_genes, ncol = n_families)}
+  else if(length(mu_male) == 2){
+    cat("Use simulated mean count from gamma with shape and rate for male. \n")
+    mu_male <- matrix(rgamma(n_genes * n_families, shape = mu_male[1], rate = mu_male[2]), nrow = n_genes, byrow = T)}
+  else if(nrow(mu_male) == n_genes & ncol(mu_male) == n_families){
+    cat("Use provided mean count matrix for male. \n")}
+  else{cat("Error: mu_male must be a matrix or a vector of length 2. \n")}
+  
+  # effect_factor: n_genes * n_families
+  if(length(effect_factor) == 1){
+    effect_factor <- matrix(effect_factor, nrow = n_genes, ncol = n_families)}
+  else if(nrow(effect_factor) == n_genes & ncol(effect_factor) == n_families){
+    cat("Use provided effect factor matrix for hybrid. \n")}
+  else{cat("Error: effect factor must have length either 1 or n_genes. \n")}
+  
+  # mu_hybrid: n_genes * n_families
+  mu_hybrid <- (effect_factor + 1)*((mu_female + mu_male)/2)
+  
+  # female_norm_factors:  vector with size = n_families
+  # male_norm_factors:  vector with size = n_families
+  # hybrid_norm_factors:  vector with size = n_families
+  norm_generator <- function(norm_factor){
+    if(is.null(norm_factor)){
+    cat("Use all 1 normalization factors for all samples. \n")
+    norm_factor <- rep(1, n_families)}
+  else if(length(norm_factor) == 2){
+    cat("Use simulated norm factors from uniform. \n")
+    norm_factor <- c(runif(n_families, min = norm_factor[1], max = norm_factor[2]))}
+  else if(length(norm_factor) == 1){
+    norm_factor <- rep(norm_factor, n_families)}
+  else{cat("Error: norm_factors must have either 2 or 1 elements. \n")}
+    return(norm_factor)
+  }
+  female_norm_factor <- norm_generator(female_norm_factor)
+  male_norm_factor <- norm_generator(male_norm_factor)
+  hybrid_norm_factor <- norm_generator(hybrid_norm_factor)
+  if(mean(female_norm_factor==1) == 1 & mean(male_norm_factor==1) == 1 & 
+     mean(hybrid_norm_factor == 1) == 1){normalization <- FALSE}
+  else{normalization <- TRUE} 
+  # normalization indicates whether we will have estimated norm factors, but whether use estimation is decided by true_norm
+  
+  # lambda_gi = C_imu_gi
+  female_lambda <- sweep(mu_female, 2, female_norm_factor, `*`)
+  male_lambda <- sweep(mu_male, 2, male_norm_factor, `*`)
+  hybrid_lambda <- sweep(mu_hybrid, 2, hybrid_norm_factor, `*`)
+  
+  # dispersion: n_genes * n_families
+  mp_disp_func <- get(MP_DISP_func)
+  mp <- (mu_female + mu_male)/2
+  # gene wise dispersion
+  dispersion <- matrix(sapply(apply(mp, 1, median), mp_disp_func), 
+                       nrow = n_genes, ncol = n_families)
+  dispersion[dispersion < 0] <- 0.01
+  print(summary(c(dispersion)))
+
+  # simulate NB data
+  pval_NB <- list()
+  qval_NB <- list()
+  DISP_est <- matrix(NA, nrow = repetition, ncol = n_genes)
+  abs_MPH <- list()
+  pval_Pois <- list()
+  qval_Pois <- list()
+  
+  cell_generator <- function(lambda, dispersion){
+    return(rnegbin(1, mu = lambda, theta = 1/dispersion))
+  }
+   
+    for(i in 1:repetition){
+      female_mat <- matrix(mapply(cell_generator, female_lambda, dispersion), nrow = n_genes)
+      male_mat <- matrix(mapply(cell_generator, male_lambda, dispersion), nrow = n_genes)
+      hybrid_mat <- matrix(mapply(cell_generator, hybrid_lambda, dispersion), nrow = n_genes)
+      rownames(hybrid_mat) <- rownames(female_mat) <- rownames(male_mat) <- paste("Gene", 1:n_genes, sep = "")
+      colnames(hybrid_mat) <- colnames(female_mat) <- colnames(male_mat) <- paste("Family", 1:n_families, sep = "")
+      
+      # determine use what type of dispersions in test
+      if(true_disp == "None"){disp_mat <- "Pois"} # only use Poisson LRT for heterosis
+      else if(true_disp){disp_mat <- dispersion} # use NB LRT with true disp and Pois LRT for heterosis
+      else{disp_mat <- NULL} # use NB LRT with estimated disp and Pois LRT for heterosis
+      
+      # determine use what type of normalization factors in test
+      if(true_norm){norm_factors <- list(female_norm_factor=female_norm_factor, # use true normalization factors in test if normalization = TRUE
+                                         male_norm_factor=male_norm_factor,
+                                         hybrid_norm_factor=hybrid_norm_factor)} 
+      else{norm_factors <- NULL} # use DESeq estimated norm factors if normalization = TRUE
+      res <- twoStageLRT(female_mat = female_mat, male_mat = male_mat,
+                         hybrid_mat = hybrid_mat, disp_mat = disp_mat,
+                         normalization = normalization, norm_factors = norm_factors, 
+                         n_fam_thres = n_fam_thres, gene_groups_no = gene_groups_no)
+      
+      pval_NB[[i]] <- res$pval_NB
+      qval_NB[[i]] <- res$qval_NB
+      DISP_est[i,] <- res$DISP
+      pval_Pois[[i]] <- res$pval_Pois
+      qval_Pois[[i]] <- res$qval_Pois
+      abs_MPH[[i]] <- abs((res$hybrid_mat_normed - (res$female_mat_normed + res$male_mat_normed)/2)/((res$female_mat_normed + res$male_mat_normed)/2))
+
+      ## sanity check especially for NB LRT when numeric algorithm fails
+      cat(paste("Proportion of Failure NB LRT is", mean(is.na(pval_NB[[i]])), "\n"))
+      if(i==1){p_single_disp_vis <- res$p_single_disp_vis}
+    }
+  
+  if(plot){
+    # dispersion visualization, true, estimated, true with mp, estimated with MP (on mu not y)
+    p_disp <- ggplot(data = data.frame(disp = c(dispersion)), aes(x = disp))+
+      geom_histogram(aes(y = after_stat(count / sum(count))))+
+      labs(title = "Simulated true dispersions")
+    p_disp_used <- ggplot(data = data.frame(disp = apply(DISP_est, 2, mean)), aes(x = disp))+
+      geom_histogram(aes(y = after_stat(count / sum(count))))+
+      labs(title = "Estimated genewise dispersions \n averaged over repetitions")
+    p_disp_scatter <- ggplot(data = data.frame(mp = apply(mp, 1, median), disp = dispersion[,1]))+
+      geom_point(aes(x=mp, y=disp))+
+      labs(title = "True MP vs Disp")
+      disp_disp_data = data.frame(Dispersion = rep(sort(dispersion[,1]),1),
+                                  Estimation = apply(DISP_est, 2, mean)[order(dispersion[,1])] # mean across repetitions
+                                # Estimation = c(apply(DISP_est, 2, mean)[order(dispersion[,1])], # mean across repetitions
+                                #                apply(DISP_est, 2, median)[order(dispersion[,1])], # median across repetitions
+                                #                DISP_est[1,order(dispersion[,1])]), # for the first repetition, single dataset
+                                # Type = rep(c("Mean across datasets", "Median across datasets", "Single dataset"), each = nrow(dispersion))
+                                )
+    cat("The summary over all genes of SD(dispersion estimation across repetitions for each gene) \n")                 
+    print(summary(apply(DISP_est, 2, sd)))
+    p_disp_disp <- ggplot(data = disp_disp_data)+
+      geom_point(aes(x = Dispersion, y = Estimation), size=1, alpha=0.6, color = "darkgray")+
+      geom_abline(aes(slope = 1, intercept = 0, color = "x=y"), linetype = "dashed", size= 1.5)+
+      theme_bw()+
+      theme(legend.position = "bottom")+
+      labs(title = "", color = "")
+    # qq plot of pval for null case (effect_factor == 0)
+    if(sum(effect_factor == 0 ) > 0){
+      Empirical_NB <- quantile(unlist(lapply(pval_NB, function(x){x[effect_factor == 0]})),
+                            seq(0.01,1,0.01), na.rm = TRUE)
+      Empirical_Pois <- quantile(unlist(lapply(pval_Pois, function(x){x[effect_factor == 0]})),
+                                 seq(0.01,1,0.01), na.rm = TRUE)
+      Unif <- qunif(seq(0.01,1,0.01))
+      pval_ccc_nb <- round(CCC(Unif, Empirical_NB)$rho.c["est"],4)
+      pval_ccc_pois <- round(CCC(Unif, Empirical_Pois)$rho.c["est"],4)
+      qq0 <- ggplot(data = data.frame(Unif = rep(Unif,2), Empirical = c(Empirical_NB, Empirical_Pois), 
+                                      Method = rep(c("2sLRT","Poisson"), each = length(Unif))))+
+        geom_point(aes(x = Unif, y = Empirical, color=Method))+
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed")+
+        labs(x = "Quantiles of unif(0,1)", y = "Quantiles of pvalues", title = "", color = "")+
+        xlim(0, 1)+
+        ylim(0, 1)+
+        theme_bw()+
+        theme(legend.position = "bottom")
+      cat(paste("\n CCC between pvalue and Uniform quantiles, NB=", pval_ccc_nb, ", Pois=", pval_ccc_pois, sep =""))
+    }
+    else{
+      qq0 <- NULL
+      pval_ccc_nb <- NA
+    }
+    
+ 
+    if(mean(effect_factor == 0) != 1){
+      # average FDR and TPR curve of qvalue with nominal alpha in (0,0.2)
+      alpha_func <- function(qvalues){
+        alphas <- round(seq(0.005,0.20,0.001),3)  
+        TPR_avg <- c()
+        FPR_avg <- c()
+        FDR_avg <- c()
+        for (a in alphas) {
+          TP_all <- lapply(qvalues, function(x){sum(x[effect_factor!=0]<=a,na.rm=TRUE)})
+          FP_all <- lapply(qvalues, function(x){sum(x[effect_factor==0]<=a,na.rm=TRUE)})
+          TN_all <- lapply(qvalues, function(x){sum(x[effect_factor==0]>a,na.rm=TRUE)})
+          FN_all <- lapply(qvalues, function(x){sum(x[effect_factor!=0]>a,na.rm=TRUE)})
+          TPR_all <- unlist(TP_all) / (unlist(TP_all) + unlist(FN_all))
+          TPR_all[is.infinite(TPR_all)] <- 0
+          TPR_avg <- c(TPR_avg, mean(TPR_all))
+          FPR_all <- unlist(FP_all) / (unlist(FP_all) + unlist(TN_all))
+          FPR_all[is.infinite(FPR_all)] <- 0
+          FPR_avg <- c(FPR_avg, mean(FPR_all))
+          FDR_all <- unlist(FP_all) / (unlist(TP_all) + unlist(FP_all))
+          FDR_all[is.infinite(FDR_all)|is.nan(FDR_all)|is.na(FDR_all)] <- 0
+          FDR_avg <- c(FDR_avg, mean(FDR_all))
+        }
+      return(list(alphas = alphas, FDR_avg = FDR_avg, TPR_avg = TPR_avg))  
+      }
+  
+      alpha_res_NB <- alpha_func(qval_NB)
+      alphas <- alpha_res_NB$alphas
+      FDR_avg_NB <- alpha_res_NB$FDR_avg
+      TPR_avg_NB <- alpha_res_NB$TPR_avg
+      alpha_res_Pois <- alpha_func(qval_Pois)
+      FDR_avg_Pois <- alpha_res_Pois$FDR_avg
+      TPR_avg_Pois <- alpha_res_Pois$TPR_avg
+      cat(paste("\n FDR at alpha=0.05 is, NB=", round(FDR_avg_NB[alphas == 0.05],4),", Pois=",  round(FDR_avg_Pois[alphas == 0.05],4), sep =""))
+      p_FDR_avg <- ggplot(data = data.frame(alpha = rep(alphas,2), FDR = c(FDR_avg_NB, FDR_avg_Pois), 
+                                            Method = rep(c("2sLRT","Poisson"), each = length(alphas))))+
+        geom_line(aes(x = alpha, y = FDR, color = Method), linewidth = 1)+
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed")+
+        xlim(0, 0.2)+
+        labs(title = "", y="Average FDR", x="Nominal FDR", color = "")+
+        theme_bw()+
+        theme(legend.position = "bottom")
+      cat(paste("\n TPR at alpha=0.05 is, NB=", round(TPR_avg_NB[alphas == 0.05],4),", Pois=",  round(TPR_avg_Pois[alphas == 0.05],4), sep =""))
+      p_TPR_avg <- ggplot(data = data.frame(alpha = rep(alphas,2), TPR = c(TPR_avg_NB, TPR_avg_Pois), 
+                                            Method = rep(c("2sLRT","Poisson"), each = length(alphas))))+
+        geom_line(aes(x = alpha, y = TPR, color = Method), linewidth = 1)+
+        # geom_vline(xintercept = 0.05, linetype = "dashed")+
+        # geom_hline(yintercept = TPR_avg_NB[alphas == 0.05], linetype = "dashed")+
+        xlim(0, 0.2)+
+        ylim(0, 1)+
+        labs(title = "", y="Average TPR", x="Nominal FDR", color = "")+
+        theme_bw()+
+        theme(legend.position = "bottom")
+      
+      at_actualFDR <- function(qvalues, actual_FDR_level = 0.05){
+        ## get a list of dataframes including cutoff = sorted qvalues, FDR, FPR and TPR, one df is for one repe
+        emp_values_single <- function(qvalue){
+          emp_df <- data.frame(cutoff = sort(qvalue), FDR = NA, TPR = NA, FPR = NA)
+          # using loop is too slow, change to the apply function
+          # for (a_ind in 1:nrow(emp_df)) {
+          #   a <- emp_df$cutoff[a_ind]
+          #   TP <- sum(qvalue[effect_factor!=0]<=a,na.rm=TRUE)
+          #   FP <- sum(qvalue[effect_factor==0]<=a,na.rm=TRUE)
+          #   TN <- sum(qvalue[effect_factor==0]>a,na.rm=TRUE)
+          #   FN <- sum(qvalue[effect_factor!=0]>a,na.rm=TRUE)
+          #   emp_df$FDR[a_ind] <- ifelse(TP+FP==0, 0, FP/(TP+FP))
+          #   emp_df$FPR[a_ind] <- ifelse(TN+FP==0, 0, FP/(TN+FP))
+          #   emp_df$TPR[a_ind] <- ifelse(TP+FN==0, 0, TP/(TP+FN))
+          # }
+          emp_df <- t(apply(emp_df, 1, function(x){
+            a <- x["cutoff"]
+            TP <- sum(qvalue[effect_factor!=0]<=a,na.rm=TRUE)
+            FP <- sum(qvalue[effect_factor==0]<=a,na.rm=TRUE)
+            TN <- sum(qvalue[effect_factor==0]>a,na.rm=TRUE)
+            FN <- sum(qvalue[effect_factor!=0]>a,na.rm=TRUE)
+            x["FDR"] <- ifelse(TP+FP==0, 0, FP/(TP+FP))
+            x["FPR"] <- ifelse(TN+FP==0, 0, FP/(TN+FP))
+            x["TPR"] <- ifelse(TP+FN==0, 0, TP/(TP+FN))
+            return(x)
+          }))
+          return(as.data.frame(emp_df))
+        }
+        ## find the average of TPR, for each repetition where TPR is the max TPR whose FDR <= 0.05
+        return(mean(unlist(lapply(lapply(qvalues, emp_values_single), 
+                           function(x){ifelse(sum(x$FDR<=actual_FDR_level) > 0, 
+                                              max(x$TPR[x$FDR <= actual_FDR_level]), NA)})), 
+                    na.rm = TRUE))
+      }
+    
+      cat(paste("\n Average TPR_max with empirical FDR <= 0.05 is, NB=",
+                round(at_actualFDR(qval_NB),4),
+                ", Pois=",  round(at_actualFDR(qval_Pois),4), "\n", sep =""))
+
+       # average and SE AUC and partial AUC only for FPR in 0,0.2 and mean ROC curve
+      mean_ROC_func <- function(qvalues, direction = c(">", "<")){
+        AUC <- unlist(lapply(qvalues, function(x){roc(response = ifelse(c(effect_factor) != 0, 1, 0), predictor = c(x), direction=direction, plot = FALSE)$auc}))
+        AUC_avg <- round(mean(AUC, na.rm = TRUE),4)
+        AUC_SE <- round(sd(AUC, na.rm = TRUE), 4)
+        
+        partial_AUC <- unlist(lapply(qvalues, function(x){auc(roc(response = ifelse(c(effect_factor) != 0, 1, 0), predictor = c(x), direction=direction, plot = FALSE), partial.auc = c(0.8, 1), partial.auc.focus = "specificity", partial.auc.correct=TRUE)}))
+        partial_AUC_avg <- round(mean(partial_AUC, na.rm = TRUE),4)
+        partial_AUC_SE <- round(sd(partial_AUC, na.rm = TRUE), 4)
+        
+        roc_res <- lapply(qvalues, function(x){do.call(cbind, roc(response = ifelse(c(effect_factor) != 0, 1, 0), predictor = c(x), direction=direction, plot = FALSE)[c("sensitivities", "specificities")])})
+        ## set actual FPR cutoffs (x-axis of mean ROC curve)
+        fpr_actual <- seq(0.0001, 0.2, 0.001)
+        ## for each actual FPR cutoff, each dataset, find the max TPR with FPR <= actual FPR
+        actual_res <- lapply(roc_res, function(x){
+          tpr_roc <- x[,"sensitivities"]
+          fpr_roc <- 1 - x[, "specificities"]
+          return(sapply(fpr_actual, function(x){max(tpr_roc[fpr_roc <= x])}))
+        })
+        ## for each actual FPR, compute average TPR across the datasets as the y-axis of mean ROC 
+        tpr_actual <- apply(do.call(rbind, actual_res), 2, mean)
+        return(list(AUC_avg = AUC_avg, AUC_SE = AUC_SE, 
+                    partial_AUC_avg = partial_AUC_avg, partial_AUC_SE = partial_AUC_SE, 
+                    fpr_actual = fpr_actual, tpr_actual = tpr_actual))
+      }
+      
+      NB_roc <- mean_ROC_func(qval_NB, direction = ">")
+      Pois_roc <- mean_ROC_func(qval_Pois, direction = ">")
+      Naive_roc <- mean_ROC_func(abs_MPH, direction = "<")
+      
+      cat(paste("\n NB: average AUC =", NB_roc$AUC_avg, " SE =", NB_roc$AUC_SE, "\n"))
+      cat(paste("Pois: average AUC =", Pois_roc$AUC_avg, " SE =", Pois_roc$AUC_SE, "\n"))
+      cat(paste("Naive: average AUC =", Naive_roc$AUC_avg, " SE =", Naive_roc$AUC_SE, "\n"))
+      
+      cat(paste("\n NB: average partial AUC =", NB_roc$partial_AUC_avg, " SE =", NB_roc$partial_AUC_SE, "\n"))
+      cat(paste("Pois: average partial AUC =", Pois_roc$partial_AUC_avg, " SE =", Pois_roc$partial_AUC_SE, "\n"))
+      cat(paste("Naive: average partial AUC =", Naive_roc$partial_AUC_avg, " SE =", Naive_roc$partial_AUC_SE, "\n"))
+      
+      p_roc_avg <- ggplot(data = data.frame(TPR = c(NB_roc$tpr_actual, Pois_roc$tpr_actual, Naive_roc$tpr_actual), 
+                                            FPR = rep(NB_roc$fpr_actual,3), 
+                                            Method = factor(rep(c("2sLRT","Poisson","Estimation"), 
+                                                                each = length(NB_roc$fpr_actual)),
+                                                            levels=c("2sLRT","Poisson","Estimation"))))+
+        geom_line(aes(x = FPR, y = TPR, color = Method, linetype = Method), linewidth = 1)+
+        xlim(0, 0.2)+
+        ylim(0, 1)+
+        labs(title = "", color="", linetype = "")+
+        theme_bw()+
+        theme(legend.position = "bottom")
+        
+    }
+    else{
+      p_roc_avg <- NULL
+      p_FDR_avg <- NULL
+      p_TPR_avg <- NULL
+      AUC_avg <- NA
+    }
+    if(is.null(qq0)){finalp <- plot_grid(p_disp, p_disp_used, p_disp_scatter, p_single_disp_vis, 
+                                         p_roc_avg, p_FDR_avg, p_TPR_avg, nrow = 2, ncol = 4)}
+    else if(is.null(p_roc_avg)){finalp <- plot_grid(p_disp, p_disp_used, p_disp_scatter, p_single_disp_vis, qq0, 
+                                                    nrow = 2)}
+    else{
+      finalp <- plot_grid(p_disp, p_disp_used, p_disp_scatter, p_single_disp_vis, 
+                          qq0, p_roc_avg, p_FDR_avg, p_TPR_avg, nrow = 2, ncol = 4)
+      paperp <- plot_grid(qq0, p_FDR_avg, p_roc_avg, p_disp_disp, nrow = 1)
+    }
+  }
+  
+  ########### Use only on slurm #############
+  if(!is.null(filename)){
+        ggsave(paste("/work/LAS/pliu-lab/qyh/Heterosis/", filename, "_0.pdf", sep = ""), finalp, width = 16, height = 8, units = "in")
+        ggsave(paste("/work/LAS/pliu-lab/qyh/Heterosis/", filename, "_4.pdf", sep = ""), paperp, width = 16, height = 4, units = "in")
+  }
+  ########################
+
+  return(finalp)
+}
+inverse_func <- function(mp){
+  disp <- (mp)^(-1/6) - 0.3 + rnorm(1, 0, sd = 0.002)
+  return(disp)
+}
+```
+
+```{r 2sLRT simulation, eval = FALSE}
+# dense heterosis pattern
+mu_female_dense <- "matrix(rgamma(case$n_genes*case$n_families, shape = 30, rate=runif(case$n_genes, 0.05, 0.2)),nrow=case$n_genes, ncol=case$n_families)"
+effect_factor_dense <- "rbind(matrix(ifelse(rbinom(case$n_genes/4*case$n_families, 1, 0.05)==1, case$sig_pos, 0),nrow = case$n_genes/4, ncol = case$n_families), matrix(ifelse(rbinom(case$n_genes/4*case$n_families, 1, 0.05)==1, case$sig_neg, 0),nrow = case$n_genes/4, ncol = case$n_families), matrix(ifelse(rbinom(case$n_genes/4*case$n_families, 1, 0.9)==1, case$sig_pos, 0),nrow = case$n_genes/4, ncol = case$n_families), matrix(ifelse(rbinom(case$n_genes/4*case$n_families, 1, 0.9)==1, case$sig_neg, 0),nrow = case$n_genes/4, ncol = case$n_families))"
+                      
+# sparse heterosis pattern
+# load("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_Prop_sig_hyb_genewise_20284.RData")
+mu_female_sparse <- "matrix(rgamma(case$n_genes*case$n_families, shape = 30, rate=runif(case$n_genes, 0.05, 0.2)), nrow=case$n_genes, ncol=case$n_families)"
+effect_factor_sparse <- "rbind(matrix(ifelse(rbinom(case$n_genes/2*case$n_families, 1, sample(prop_sig_hybrids_per_gene, size = case$n_genes/2, replace=TRUE)) == 1, case$sig_pos, 0), nrow = case$n_genes/2, ncol = case$n_families), matrix(ifelse(rbinom(case$n_genes/2*case$n_families, 1, sample(prop_sig_hybrids_per_gene, size = case$n_genes/2, replace=TRUE)) == 1, case$sig_neg, 0), nrow = case$n_genes/2, ncol = case$n_families))"
+
+
+case <- list(n_genes = 100, n_families = 50, 
+             sig_pos = 2, sig_neg = -3/4,
+             mu_female = mu_female_dense,
+             mu_male = "case$mu_female",
+             effect_factor = effect_factor_dense,
+             female_norm_factor = c(0.8, 1.3), male_norm_factor = c(0.8, 1.3), hybrid_norm_factor = c(0.8, 1.3),
+             MP_DISP_func = "inverse_func", true_disp = FALSE, true_norm = FALSE,
+             n_fam_thres = 4, gene_groups_no = 1, repetition = 3, plot = TRUE, filename = NULL)
+print(case)
+if(is.character(case$mu_female)){case$mu_female <- eval(parse(text = case$mu_female))}
+if(is.character(case$mu_male)){case$mu_male <- eval(parse(text = case$mu_male))}
+if(is.character(case$effect_factor)){case$effect_factor <- eval(parse(text = case$effect_factor))}
+res <- Heter_pip_2sLRT(n_genes = case$n_genes, n_families = case$n_families,
+                       mu_female = case$mu_female, mu_male = case$mu_male,
+                       effect_factor = case$effect_factor,
+                       female_norm_factor = case$female_norm_factor,
+                       male_norm_factor = case$male_norm_factor,
+                       hybrid_norm_factor = case$hybrid_norm_factor,
+                       true_norm = case$true_norm,
+                       MP_DISP_func = case$MP_DISP_func, true_disp = case$true_disp,
+                       n_fam_thres = case$n_fam_thres,
+                       gene_groups_no = case$gene_groups_no,
+                       repetition = case$repetition, plot = case$plot,
+                       filename = case$filename)
+print(res)
+```
+
+## Real data analysis
+
+#### 1. Specify which dataset to be used
+
+###### Apply two stage LRT to Maize Heterosis Analysis with 20284 genes
+```{r 2sLRT for real data format 20284, eval = FALSE}
+## Step 1. Get the 20284 genes and the corresponding raw counts, normalized counts and normalization factors
+DGE <- DESeqDataSetFromMatrix(countData = dat, 
+                              colData = data.frame(sample = 1:ncol(dat)),
+                              design = model.matrix(~c(1:ncol(dat))))
+DGE <- estimateSizeFactors(DGE)
+dat_normed <- DESeq2::counts(DGE, normalized = T)
+norm_factors_all <- DGE$sizeFactor
+
+load("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/RealDataExploratory.RData")
+gene_max_fam_zerocounts <- apply(fam_zerocounts, 1, max)
+dense_genes <- rownames(dat)[gene_max_fam_zerocounts == 0]
+
+normed_dense_dat <- dat_normed[dense_genes,]
+dense_dat <- dat[dense_genes,]
+
+raw_use <- dense_dat
+norm_use <- normed_dense_dat
+norm_factors_use <- norm_factors_all
+```
+
+###### Apply two stage LRT to Maize Heterosis Analysis with 19880 genes
+```{r 2sLRT for real data format 19880, eval = FALSE}
+cat("This is analysis on 19880 genes, all raw counts will be added 1:\n")
+## 1. Get the 19880 genes and the corresponding raw counts, normalized counts and normalization factors
+# normalization
+dat_pseudo <- dat + 1
+DGE_pseudo <- DESeqDataSetFromMatrix(countData = dat_pseudo, 
+                              colData = data.frame(sample = 1:ncol(dat_pseudo)),
+                              design = model.matrix(~c(1:ncol(dat_pseudo))))
+DGE_pseudo <- estimateSizeFactors(DGE_pseudo)
+dat_normed_pseudo <- DESeq2::counts(DGE_pseudo, normalized = T)
+norm_factors_all_pseudo <- DGE_pseudo$sizeFactor
+# select genes
+int_genes <- read.table("~/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/MPH_FPKM_F1_P_grp1_miss03.txt", header = T, sep="", fill = T, check.names = FALSE)$Gene
+
+# get data table
+int_dat <- dat_pseudo[int_genes,]
+normed_int_dat <- dat_normed_pseudo[int_genes,] 
+
+
+raw_use <- int_dat
+norm_use <- normed_int_dat
+norm_factors_use <- norm_factors_all_pseudo
+```
+
+#### 2. Run 2sLRT
+```{r perform 2sLRT on real data, eval = FALSE}
+# values of tuning parameters
+seqerr_thres = 15      # threshold for family sum count as sequencing error
+gene_groups_no = 10     # number of clusters
+n_fam_thres = 50       # number of null families threshold for dispersion estimation
+  
+##### Step 2: Gene-wise pre-test - Poisson LRT for MPH and Poisson LRT for null-family ####
+  gene_test_func <- function(gene){
+  # compute pvalues from test using raw counts and norm factors
+    pval_Pois <- c()    # for Poisson LRT MPH
+    pval_family <- c()  # for Poisson LRT equal family
+    if(sd(gene) == 0){
+      # if this gene is equally expressed in all varieties
+      pval_Pois <-  pval_family <- rep(1, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      pval_Pois[hb_num] <- Hetero_Pois_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                           C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                           C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                           C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])
+      pval_family[hb_num] <- Pois_3mean_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                            C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                            C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                            C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])
+      names(pval_Pois)[hb_num] <- hybrid_info$hybrid[hb_num]
+      names(pval_family)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(pval_Pois = pval_Pois, pval_family = pval_family))
+}
+
+  gene_est_func <- function(gene){
+  # get MP, MPH ratio and diff MPH ratio from normalized data, i.e. estimation of mu_gi under global/Hg1
+    MP <- c()           # mid parents
+    hyb_ratio <- c()    # MPH ratio = hyb/MP
+    diff_ratio <- c()   # MPH diff ratio = (hyb-MP) / MP
+    family_mean <- c()  # family mean 
+    if(all(gene == 0)){
+      # if this gene is not expressed in all varieties
+      MP <- hyb_ratio <- diff_ratio <- family_mean <- rep(0, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      MP[hb_num] <- mean(c(female, male))
+      family_mean[hb_num] <- mean(c(female, male, hybrid))
+      hyb_ratio[hb_num] <- hybrid/(MP[hb_num])
+      diff_ratio[hb_num] <- (hybrid - MP[hb_num]) / (MP[hb_num])
+      names(MP)[hb_num] <- names(family_mean) <- names(hyb_ratio)[hb_num] <- names(diff_ratio)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(MP = MP, family_mean = family_mean, hyb_ratio = hyb_ratio, diff_ratio = diff_ratio))
+  }
+  
+  test_result_list <- lapply(1:nrow(raw_use), function(i) gene_test_func(raw_use[i, ]))
+  est_result_list <- lapply(1:nrow(norm_use), function(i) gene_est_func(norm_use[i, ]))
+
+  
+  # combine genewise pre-test as a matrix, the order of results is consistent of hybrids in hybrid_info.
+  pval_Pois <- do.call(rbind, lapply(test_result_list, function(x) x$pval_Pois))
+  pval_family <- do.call(rbind, lapply(test_result_list, function(x) x$pval_family))
+  MP <- do.call(rbind, lapply(est_result_list, function(x) x$MP))
+  family_mean <- do.call(rbind, lapply(est_result_list, function(x) x$family_mean))
+  diff_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$diff_ratio))
+  hyb_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$hyb_ratio))
+  rownames(pval_Pois) <- rownames(pval_family) <- rownames(MP) <- rownames(hyb_ratio) <- rownames(diff_ratio) <- rownames(family_mean) <- rownames(raw_use)
+  colnames(pval_Pois) <- colnames(pval_family) <- colnames(MP) <- colnames(hyb_ratio) <- colnames(diff_ratio) <- colnames(family_mean) <- hybrid_info$hybrid
+
+  qval_Pois <- apply(pval_Pois, 2, function(x){p.adjust(x, method = "fdr")})
+  qval_family <- apply(pval_family, 2, function(x){p.adjust(x, method = "fdr")})
+  
+##### Step 3: Replace fake sig cells with pvalue 1 in Poisson Heterosis LRT####
+  pval_Pois_filter <- pval_Pois
+  pval_Pois_filter[family_mean*3 < seqerr_thres] <- 1
+  qval_Pois_filter <- apply(pval_Pois_filter, 2, function(x){p.adjust(x, method = "fdr")})
+
+##### Step 4: Estimate dispersion matrix ####
+  null_disp_ind <- qval_family > 0.1
+  DISP <- rep(NA, nrow(null_disp_ind)) # each gene will only have one dispersion estimation
+  names(DISP) <- rownames(null_disp_ind)
+  null_disp_ind_sub <- null_disp_ind[apply(null_disp_ind, 1, function(x) sum(x == 1)) >= n_fam_thres,]
+  jacc_dist <- dist(null_disp_ind_sub, "binary")
+  jacc_hc <- hclust(jacc_dist)
+  jacc_clust <- cutree(jacc_hc, gene_groups_no)
+  cat("Gene clusters size: \n")
+  print(table(jacc_clust))
+  for (i_clust in unique(jacc_clust)) {
+    genes_clust <- rownames(null_disp_ind_sub)[jacc_clust == i_clust]
+    ind_clust <- null_disp_ind_sub[genes_clust,]
+    worst_gene <- genes_clust[which.max(apply(ind_clust, 1, function(x) sum(x==0)))]
+    families_clust <- colnames(null_disp_ind_sub)[null_disp_ind_sub[worst_gene,] == 1]
+    cat(paste("Dispersion estimation for cluster", i_clust, "the number of families is", length(families_clust),", number of genes is ", length(genes_clust)," \n"))
+    counts_clust <- matrix(NA, nrow = length(genes_clust), ncol = 3 * length(families_clust))
+    for(n_hybrid in 1:length(families_clust)){
+      counts_clust[,(n_hybrid - 1) * 3 + 1] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"female"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 2] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"male"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 3] <- raw_use[genes_clust, families_clust[n_hybrid]]
+    }
+    group_clust <- rep(paste("G", 1:length(families_clust), sep = ""), each = 3)
+    DISP[genes_clust] <- Disp_est_null_family(counts = counts_clust, group = group_clust)
+  }
+  cat("Dispersion estimation summary:\n")
+  print(summary(DISP))
+  # #SS2: fit a loess curve to predict the dispersions for genes whose number of all-null families do not reach the minimal requirement 50 all-null families
+    loess_x <- apply(MP, 1, median)
+    x <- loess_x[!is.na(DISP)]
+    y <- DISP[!is.na(DISP)]
+    if(sd(x) > 0){
+      new_x <- loess_x[is.na(DISP)]
+      loess_fit <- loess(y~x, span = 0.1)
+      pred_disp <- predict(loess_fit, newdata = new_x)
+      extra <- new_x[is.na(pred_disp) | pred_disp <= 0]
+      intra <- new_x[!is.na(pred_disp) & pred_disp > 0 ]
+      intra_disp <- pred_disp[!is.na(pred_disp) & pred_disp > 0 ]
+      extra_disp <- ifelse(extra < min(x), y[which.min(x)], y[which.max(x)])
+      pred_disp[is.na(pred_disp) | pred_disp <= 0] <- extra_disp
+      DISP[is.na(DISP)] <- pred_disp
+      }
+    dispersion_mat <- matrix(DISP, nrow = nrow(raw_use), ncol = nrow(hybrid_info))
+    colnames(dispersion_mat) <- hybrid_info$hybrid
+    rownames(dispersion_mat) <- rownames(raw_use)
+
+##### Step 5: NB estimation with known dispersion matrix ####
+  NB_gene_func <- function(gene_ind){
+    gene <- raw_use[gene_ind,]
+    gene_name <- rownames(raw_use)[gene_ind]
+    pval <- c()
+    if(sd(gene) == 0){pval <- rep(1, nrow(hybrid_info))}
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      dispersion <- dispersion_mat[gene_name, hybrid_info$hybrid[hb_num]]
+      if(dispersion == 0){pval[hb_num] <- Hetero_Pois_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                                          C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                                          C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                                          C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])}
+      else{pval[hb_num] <- Hetero_NB_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                         C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                         C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                         C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]],
+                                         dispersion = dispersion)}
+      names(pval)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(pval)
+  }
+  
+  pval_NB <- do.call(rbind, lapply(1:nrow(raw_use),  NB_gene_func))
+  rownames(pval_NB) <- rownames(raw_use)
+  qval_NB <- apply(pval_NB, 2, function(x){p.adjust(x, method = "fdr")})
+  
+##### Step 6: Replace fake sig cells with pvalue 1 in NB Heterosis LRT####
+  pval_NB_filter <- pval_NB
+  pval_NB_filter[family_mean*3 < seqerr_thres] <- 1
+  qval_NB_filter <- apply(pval_NB_filter, 2, function(x){p.adjust(x, method = "fdr")})
+```
+
+```{r save results, eval = FALSE}
+# save.image("~/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_RealData19880ResNormAll.RData")
+# save(DISP, file =  "/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_dispersion_estimation_19880.RData")
+# save(pval_NB, qval_NB, file =  "/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_NBpqvalue_20284.RData")
+```
+
+
+#### 3. Visualization
+
+```{r visualization for 20284, eval = FALSE}
+load("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_RealData20284ResNormAll.RData")
+```
+
+```{r visualization for 19880, eval = FALSE}
+load("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_RealData19880ResNormAll.RData")
+```
+
+```{r, visualization of real data, eval = TRUE}
+plot <- TRUE
+sig_gene_thres <- 0.2
+significance <- 0.05
+
+cat("Total proportion of MPH cells in Poisson LRT: \n")
+print((mean(qval_Pois<=significance)))
+cat("Proportion of genes with more than 50% MPH hybrids in Poisson LRT: \n")
+print((sum(apply(qval_Pois, 1, function(x){mean(x<=significance)>0.5}))))
+cat("Proportion of hybrids with more than 50% MPH genes in Poisson LRT: \n")
+print((sum(apply(qval_Pois, 2, function(x){mean(x<=significance)>0.5}))))
+
+cat("Total proportion of MPH cells in NB LRT: \n")
+print((mean(qval_NB<=significance, na.rm=TRUE)))
+cat("Proportion of genes with more than 50% MPH hybrids in NB LRT: \n")
+print((sum(apply(qval_NB, 1, function(x){mean(x<=significance, na.rm=TRUE)>0.5}))))
+cat("Proportion of hybrids with more than 50% MPH genes in NB LRT: \n")
+print((sum(apply(qval_NB, 2, function(x){mean(x<=significance, na.rm=TRUE)>0.5}))))
+
+  ##### Step 7: combine qval_NB (do not use filter) for NB with qval_Pois for Pois ####
+  qval_final<- qval_NB
+  # if NB LRT fails (no roots found), use Pois LRT
+  qval_final[is.na(qval_final)] <- qval_Pois[is.na(qval_final)]
+  
+  ##### Step 8: visualization ####
+  p_norm_factor <- ggplot(data.frame(norm_fac = norm_factors_use), aes(x=norm_fac))+
+    geom_histogram(aes(y = after_stat(count / sum(count))))+
+    theme_bw()+
+    labs(x="Normalization factors", title = "Normalization factors for 802 samples from DESeq on 43128 gene")
+  # MP estimation visualization
+  p_hist_MP <- ggplot(data.frame(genewise_median_MP = apply(MP, 1, median)), aes(x = genewise_median_MP)) +
+    geom_histogram(fill = "blue", color = "black", alpha = 0.7) +
+    labs(title = "Genewise median MP estimation under global (normed counts)", x = "MP", y = "Frequency") +
+    theme_bw() +
+    facet_wrap(~ifelse(genewise_median_MP <= 20000, "< 20000", " > 20000"), scales = "free")
+  print(p_hist_MP)
+  # Estimated dispersion 
+  disp_dat <- data.frame(Dispersion=c(y, intra_disp, extra_disp), MP=c(x, intra, extra),
+                         type = factor(rep(c("Estimated","Predicted","Extrapolated"), 
+                                    c(length(x), length(intra), length(extra))), 
+                                    levels = c("Estimated","Predicted","Extrapolated")))
+   p_disp_overall <- ggplot()+
+    geom_point(data=disp_dat,aes(x=MP, y=Dispersion, color = type))+ 
+    geom_line(data=data.frame(x=x, y=loess_fit$fitted),aes(x=x, y=y), color = "red") +
+    labs(title = "", x="MP", y="Dispersion", color = "Type") +
+    theme_bw()+
+    xlim(0,max(new_x))+
+     theme(legend.position = "bottom")+
+     scale_color_manual(values=c("Black","Green","Blue"))
+  p_disp_cut <- p_disp_overall+xlim(0,2000)
+  print(ggarrange(p_disp_overall, p_disp_cut, common.legend = TRUE, legend = "bottom"))
+  # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_disp_mp.pdf", ggarrange(p_disp_overall, p_disp_cut, common.legend = TRUE, legend = "bottom"), width = 8, height = 4, unit = "in")
+  
+  p_disp_estimated <- ggplot()+
+    geom_point(data=data.frame(x=x, y=y),aes(x=x, y=y), color = "black", size=1) +
+    geom_point(data=data.frame(x=intra, y=intra_disp), aes(x=x, y=y), color="green", size=1)+
+    geom_line(data=data.frame(x=x, y=loess_fit$fitted),aes(x=x, y=y), color = "red") +
+    labs(title = "Estimated(black), Fitted(red), Predicted(green)", x="MP", y="Dispersion") +
+    theme_bw()
+  simx <- rgamma(1000, 30, 0.1)
+  simx2 <- rgamma(1000, 30, 0.2)
+  simx3 <- rgamma(1000, 30, 0.05)
+  p_disp_estimated_cut <- p_disp_estimated+xlim(0,1000)+
+    geom_point(data=data.frame(x=simx, y=1/(simx)^(1/6)-0.3),aes(x=x,y=y), color="red",size=1)+labs(title="Red dots for MP^(-1/6)-0.3")+
+    geom_point(data=data.frame(x=simx2, y=1/(simx2)^(1/6)-0.3),aes(x=x,y=y), color="red",size=1)+
+    geom_point(data=data.frame(x=simx3, y=1/(simx3)^(1/6)-0.3),aes(x=x,y=y), color="red",size=1)
+
+  print(ggarrange(p_disp_estimated, p_disp_estimated_cut))
+  
+  ## pvalue histogram
+  p_hist_NB_pval <- ggplot(data = data.frame(NBpval = c(pval_NB)), aes(x=NBpval))+
+    geom_histogram(aes(y = after_stat(count / sum(count))))+
+    labs(title="", x = "2sLRT p-values", y = "Proportion")+
+      theme_bw()
+  p_hist_Pois_pval <- ggplot(data = data.frame(Poispval = c(pval_Pois)), aes(x=Poispval))+
+    geom_histogram(aes(y = after_stat(count / sum(count))))+
+    labs(title="",x = "Poisson p-values", y = "Proportion")+
+      theme_bw()
+  p_pval_hist <- ggarrange(p_hist_NB_pval, p_hist_Pois_pval)
+  print(p_pval_hist)
+  # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_pval_hist.pdf", p_pval_hist, width = 8, height = 4, unit = "in")
+  
+  plot_val <- qval_final
+  prop_sig_hybrids_per_gene <- apply(plot_val, 1, function(x){mean(x<=significance)})
+  # save(prop_sig_hybrids_per_gene, file="/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_Prop_sig_hyb_genewise_20284.RData")
+  
+  if(plot){
+    # histogram of proportion of heterosis hybrids per gene
+    gene_prop_hist <- ggplot(data = data.frame(prop_sig_hybrids_per_gene = prop_sig_hybrids_per_gene), aes(x=prop_sig_hybrids_per_gene))+
+    geom_histogram(aes(y = after_stat(count / sum(count))), bins=100)+
+    labs(title="", x="Proportion of MPH hybrids per gene",y="Proportion")+
+      theme_bw()
+    cat(paste("Number of genes with more than ", sig_gene_thres, " heterosis hybrids = ", sum(prop_sig_hybrids_per_gene > sig_gene_thres), sep = ""))
+     hyb_prop_hist <- ggplot(data = data.frame(prop =  apply(plot_val, 2, function(x){mean(x <= significance)})), aes(x=prop))+
+    geom_histogram(aes(y = after_stat(count / sum(count))), bins=100)+
+    labs(title="", x="Proportion of MPH genes per family", y="Proportion")+
+      theme_bw()
+     prop_hist <- ggarrange(gene_prop_hist, hyb_prop_hist)
+    print(prop_hist)
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_sigprop_hist.pdf", prop_hist, width = 8, height = 4, unit = "in")
+    
+    # mu_female+mu_male / 2 vs delta_g for sig cells
+    sig_family_filter <- list()
+    for(hyb in hybrid_info$hybrid){
+      g_ind <- plot_val[,hyb] <= significance
+      f <- hybrid_info$female[hybrid_info$hybrid == hyb]
+      m <- hybrid_info$male[hybrid_info$hybrid == hyb]
+      sig_family_filter <- append(sig_family_filter, list(data.frame(female = norm_use[g_ind,f],
+                                                                     male = norm_use[g_ind,m],
+                                                                     hybrid = norm_use[g_ind,hyb],
+                                                                     row.names = rownames(norm_use)[g_ind])))
+      names(sig_family_filter)[length(sig_family_filter)] <- hyb
+    }
+    # check parents of the significant cells
+    num_sig <- (unlist(lapply(sig_family_filter, nrow)))
+    num_female_sig <- tapply(num_sig, sapply(names(num_sig),function(x){strsplit(x, "/")[[1]][1]}), sum)
+    num_male_sig <- tapply(num_sig, sapply(names(num_sig),function(x){strsplit(x, "/")[[1]][2]}), sum)
+    sig_female <-ggplot(data=data.frame(female=names(num_female_sig), sigs = num_female_sig/sum(num_female_sig)),
+                        aes(x=reorder(female, -sigs), y=sigs)) +
+      theme(axis.text.y = element_text(size = 3))+
+      geom_bar(stat="identity")+coord_flip()+
+      labs(y="MPH proportion", x = "Female")
+    sig_male <-ggplot(data=data.frame(male=names(num_male_sig), sigs = num_male_sig/sum(num_male_sig)), 
+                      aes(x=reorder(male, -sigs), y=sigs)) +
+      theme(axis.text.y = element_text(size = 3))+
+      geom_bar(stat="identity")+coord_flip()+
+      labs(y="MPH proportion", x = "Male")
+    sig_parents <- ggarrange(sig_female, sig_male, nrow=1)
+    print(sig_parents)
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_parents_bar.pdf", sig_parents, width = 8, height = 6, unit = "in")
+    
+    list_MPH <- lapply(sig_family_filter, function(x){t(apply(x, 1, function(y){c(mean(c(y[1],y[2])), y[3]/mean(c(y[1],y[2])), (y[3]-mean(c(y[1],y[2])))/mean(c(y[1],y[2])))}))})
+    MP <- dplyr::select(bind_rows(lapply(list_MPH,function(x){x[,1]}), .id = "id"), -c("id"))
+    hyb_ratio <- dplyr::select(bind_rows(lapply(list_MPH,function(x){x[,2]}), .id = "id"), -c("id"))
+    diff_ratio <- dplyr::select(bind_rows(lapply(list_MPH,function(x){x[,3]}), .id = "id"),-c("id"))
+    df_per_hybrid <- data.frame(MP = rep(apply(MP, 1, median, na.rm = TRUE), 2),
+                                prop_sig_genes = rep(unlist(lapply(sig_family_filter, nrow))/nrow(plot_val),2),
+                                MPH_ratio = c(log(apply(hyb_ratio, 1, median, na.rm = TRUE)), apply(diff_ratio, 1, median, na.rm = TRUE)),
+                                type = rep(c("log(hybrid/MP)", "(hybrid-MP)/MP"), c(nrow(hyb_ratio), nrow(diff_ratio))))
+    per_hybrid_MP <- ggplot(df_per_hybrid[df_per_hybrid$type == "log(hybrid/MP)",], 
+                            aes(x = log(MP), y = (MPH_ratio)))+
+      geom_point(size = 1)+
+      # facet_wrap(vars(type),scales = "free")+
+      geom_hline(yintercept = 0)+
+      labs(title="Per hybrid averaged over genes", x = "log(MP)", y = "log(hybrid/MP)")+
+      theme_bw()
+    per_hybrid_prop <- ggplot(df_per_hybrid[df_per_hybrid$type == "log(hybrid/MP)",],
+                              aes(x = MPH_ratio, y = prop_sig_genes))+
+      geom_point(size = 1)+
+      # facet_wrap(vars(type),scales = "free")+
+      geom_vline(xintercept = 0)+
+      labs(title="Per hybrid averaged over genes", y = "Prop of MPH genes", 
+           x = "log(hybrid/MP)")+
+      theme_bw()
+
+    df_per_gene <- data.frame(MP = log(rep(apply(MP, 2, median, na.rm = TRUE), 2)),
+                              prop_sig_hybrids = rep(apply(plot_val[colnames(hyb_ratio), ], 1, function(x){mean(x<=significance)}),2),
+                              MPH_ratio = c(log(apply(hyb_ratio, 2, median, na.rm = TRUE)), apply(diff_ratio, 2, median, na.rm = TRUE)),
+                              type = rep(c("log(hybrid/MP)", "(hybrid-MP)/MP"), c(ncol(hyb_ratio), ncol(diff_ratio))))
+    per_gene_MP <- ggplot(data=df_per_gene[df_per_gene$type == "log(hybrid/MP)",],
+                         aes(x = MP, y = MPH_ratio))+
+      geom_point(size = 1)+
+      geom_hline(yintercept = 0)+
+      # facet_wrap(vars(type),scales = "free")+
+      labs(title="Per gene averaged over hybrids", x = "log(MP)", y="log(hybrid/MP)")+
+      theme_bw()
+    per_gene_prop <- ggplot(data=df_per_gene[df_per_gene$type == "log(hybrid/MP)",],
+                         aes(x = MPH_ratio, y = prop_sig_hybrids))+
+      geom_point(size = 1)+
+      geom_vline(xintercept = 0)+
+      # facet_wrap(vars(type),scales = "free")+
+      labs(title="Per gene averaged over hybrids", y = "Prop of MPH hybrids", x="log(hybrid/MP)")+
+      theme_bw()
+    print(ggarrange(per_gene_MP, per_gene_prop, per_hybrid_MP, per_hybrid_prop))  
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_MPvsMPH_gene.pdf", ggarrange(per_gene_MP+labs(title = ""), per_gene_prop+labs(title = "")), width = 8, height = 4, unit = "in")
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_MPvsMPH_hybrid.pdf", ggarrange(per_hybrid_MP+labs(title = ""), per_hybrid_prop+labs(title = "")), width = 8, height = 4, unit = "in")
+    
+    # using median absolute log FC value
+    df_per_hybrid_abs <- data.frame(MP = rep(apply(MP, 1, median, na.rm = TRUE), 2),
+                                prop_sig_genes = rep(unlist(lapply(sig_family_filter, nrow))/nrow(plot_val),2),
+                                MPH_ratio = c((apply(abs(log(hyb_ratio)), 1, median, na.rm = TRUE)), apply(diff_ratio, 1, median, na.rm = TRUE)),
+                                type = rep(c("abs(log(hybrid/MP))", "(hybrid-MP)/MP"), c(nrow(hyb_ratio), nrow(diff_ratio))))
+    per_hybrid_MP_abs <- ggplot(df_per_hybrid_abs[df_per_hybrid_abs$type == "abs(log(hybrid/MP))",], 
+                            aes(x = log(MP), y = (MPH_ratio)))+
+      geom_point(size = 1)+
+      labs(title="Per hybrid averaged over genes", x = "log(MP)", y = "abs(log(hybrid/MP))")+
+      theme_bw()+
+      ylim(0,0.9)
+    per_hybrid_prop_abs <- ggplot(df_per_hybrid_abs[df_per_hybrid_abs$type == "abs(log(hybrid/MP))",],
+                              aes(x = MPH_ratio, y = prop_sig_genes))+
+      geom_point(size = 1)+
+      xlim(0,0.9)+
+      labs(title="Per hybrid averaged over genes", y = "Prop of MPH genes", 
+           x = "abs(log(hybrid/MP))")+
+      theme_bw()
+
+    df_per_gene_abs <- data.frame(MP = log(rep(apply(MP, 2, median, na.rm = TRUE), 2)),
+                              prop_sig_hybrids = rep(apply(plot_val[colnames(hyb_ratio), ], 1, function(x){mean(x<=significance)}),2),
+                              MPH_ratio = c((apply(abs(log(hyb_ratio)), 2, median, na.rm = TRUE)), apply(diff_ratio, 2, median, na.rm = TRUE)),
+                              type = rep(c("abs(log(hybrid/MP))", "(hybrid-MP)/MP]"), c(ncol(hyb_ratio), ncol(diff_ratio))))
+    per_gene_MP_abs <- ggplot(data=df_per_gene_abs[df_per_gene_abs$type == "abs(log(hybrid/MP))",],
+                         aes(x = MP, y = MPH_ratio))+
+      geom_point(size = 1)+
+      ylim(0,6)+
+      labs(title="Per gene averaged over hybrids", x = "log(MP)", y="abs(log(hybrid/MP))")+
+      theme_bw()
+    per_gene_prop_abs <- ggplot(data=df_per_gene_abs[df_per_gene_abs$type == "abs(log(hybrid/MP))",],
+                         aes(x = MPH_ratio, y = prop_sig_hybrids))+
+      geom_point(size = 1)+
+      xlim(0,6)+
+      labs(title="Per gene averaged over hybrids", y = "Prop of MPH hybrids", x="abs(log(hybrid/MP))")+
+      theme_bw()
+    print(ggarrange(per_gene_MP_abs, per_gene_prop_abs, per_hybrid_MP_abs, per_hybrid_prop_abs))  
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_MPvsMPHabs_gene.pdf", ggarrange(per_gene_MP_abs+labs(title = ""), per_gene_prop_abs+labs(title = "")), width = 8, height = 4, unit = "in")
+    # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_MPvsMPHabs_hybrid.pdf", ggarrange(per_hybrid_MP_abs+labs(title = ""), per_hybrid_prop_abs+labs(title = "")), width = 8, height = 4, unit = "in")
+    
+    cat(paste("Number of significant genes with median MPH ratio > 0: ", sum(apply(diff_ratio, 2, median, na.rm = TRUE)>0), "; \n Number of hybrids with median MPH ratio > 0:  ", sum(apply(diff_ratio, 1, median, na.rm = TRUE)>0), sep = ""))
+    
+    # histogram of heterosis hybrid and their parents
+    real_large_df <- bind_rows(sig_family_filter, .id = "column_label")
+    hybrid_hist <- ggplot(data = data.frame(hetero_hybrids = log(real_large_df$hybrid+1)), aes(x=hetero_hybrids))+
+    geom_histogram(aes(y = after_stat(count / sum(count))))+
+    labs(title="log(count + 1) of heterosis hybrids",y = "frequency")+
+      theme_bw()
+    parents_hist <- ggplot(data = data.frame(hetero_parents = c(log(real_large_df$female+1), log(real_large_df$male+1))), aes(x=hetero_parents))+
+    geom_histogram(aes(y = after_stat(count / sum(count))))+
+    labs(title="log(count + 1) of heterosis parents", y = "frequency")+
+      theme_bw()
+    print(ggarrange(parents_hist, hybrid_hist, nrow = 2))
+  }
+```
+
+#### 4. Housekeeping genes validation
+
+```{r housekeeping, eval=TRUE}
+HKG <- c("Zm00001d045417", "Zm00001d010476", "Zm00001d015962", "Zm00001d039138",
+         "Zm00001d051879", "Zm00001d002944", "Zm00001d044172", "Zm00001d006438", 
+         "Zm00001d036201")
+
+# 1. Number of all null family based on qvalue > 0.1
+cat("HKG: Number of all null family based on qvalue > 0.1 \n")
+HKG_qval_family <- qval_family[HKG,]
+apply(HKG_qval_family, 1, function(x){sum(x>0.1)})
+# 2. Dispersion estimation and predication
+cat("HKG: Dispersion estimation and predication \n")
+HKG_disp <- DISP[HKG]
+round(HKG_disp, 3)
+# 3. Proportion of MPH hybrids based on NB LRT qvalue <= 0.05
+cat("HKG: Proportion of MPH hybrids based on NB LRT qvalue <= 0.05 \n")
+HKG_qval_NB <- qval_NB[HKG,]
+round(apply(HKG_qval_NB, 1, function(x){mean(x<=significance)}), 3)
+
+# 4. On Oct20,2024, Dr. Liu suggested add poisson LRT results for MPH for comparison
+cat("HKG: Proportion of MPH hybrids based on Poisson LRT qvalue <= 0.05 \n")
+HKG_qval_Pois <- qval_Pois[HKG,]
+round(apply(HKG_qval_Pois, 1, function(x){mean(x<=significance)}), 3)
+```
+
+#### 5. Additional step for 19880: determine MPH genes
+```{r determine the heterosis genes 19880, eval = TRUE}
+pp_dist <- dist(pval_NB)
+pp_hc <- hclust(pp_dist)
+pp_clusters <- cutree(pp_hc, k=3)
+table(pp_clusters)
+
+pp_hist_df <- data.frame(pvals=c(c(pval_NB[pp_clusters==1,]),
+                                 c(pval_NB[pp_clusters==2,]),
+                                 c(pval_NB[pp_clusters==3,])),
+                         clusters = rep(1:3, table(pp_clusters)*599))
+pp_cluster_hist <- ggplot(pp_hist_df, aes(x = pvals)) +
+  geom_histogram(aes(y = after_stat(count / sum(count))))+
+    facet_wrap(vars(clusters), scales = "free_y")+
+    labs(title="Histogram of NB pvalues for three clusters")+
+      theme_bw()
+
+print(pp_cluster_hist)
+
+# ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_ppclust.pdf", pp_cluster_hist, width = 8, height = 4, unit = "in")
+
+hete_pval <- apply(pval_NB, 1, function(x){ks.test(x, y="punif",alternative = "greater")$p.value})
+hete_qval <- p.adjust(hete_pval, method = "BH")
+nonhete_pval <- apply(pval_NB, 1, function(x){ks.test(x, y="punif",alternative = "less")$p.value})
+pp_ks_pval <- ggplot(data.frame(pval=hete_pval),aes(x=pval))+geom_histogram(aes(y = after_stat(count / sum(count))))+theme_bw()+labs(title = "Pvalues of 19880 genes from one-sided KS test")
+
+pp_ks_qval <- ggplot(data.frame(qval=p.adjust(hete_pval,method = "BH")),aes(x=qval))+geom_histogram(aes(y = after_stat(count / sum(count))))+theme_bw()+labs(title = "Qvalues of 19880 genes from one-sided KS test")+
+  annotate("text", x = 0.5, y = 0.2, label = paste("Number of heterosis genes (qval<=0.05):", sum(p.adjust(hete_pval,method = "BH")<=significance)))
+pp_ks <- ggarrange(pp_ks_pval, pp_ks_qval)
+
+# ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_ppks.pdf", pp_ks, width = 8, height = 4, unit = "in")
+
+# compare ks qvalues with proportion of sig hybrids
+pp_ks_prop <- ggplot(data.frame(ks_qval=sort(hete_qval), 
+                                prop_sig_hyb = prop_sig_hybrids_per_gene[order(hete_qval)], 
+                                Genes = 1:length(hete_qval)))+
+  geom_point(aes(x=ks_qval, y=prop_sig_hyb))+
+  theme_bw()+
+  geom_vline(xintercept = 0.05, color="red")+
+  annotate("text", x=0.1, y=0.25, label="0.05", color="red")+
+  geom_hline(yintercept = max(prop_sig_hybrids_per_gene[hete_qval>significance]), color="blue")+
+  annotate("text", x=0.25, y=0.1, label=as.character(round(max(prop_sig_hybrids_per_gene[hete_qval>significance]),4)), color="blue")+
+  annotate("text",x=0.5, y=0.5, label="Use ksqval<=0.05 gives 9339 genes \n Use prop>0.0518 gives 6458 genes")+
+  labs(x="KS one-sided qvalue",y="Proportion of sig hyb per gene", title = "Selection of heterosis genes")
+# print and save MPH genes from KS and prop selection
+# write.table(data.frame(MPH_genes=names(prop_sig_hybrids_per_gene[prop_sig_hybrids_per_gene>max(prop_sig_hybrids_per_gene[hete_qval>significance])])), file = "/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/IntermediateRes/WithNormFactors/Normfac_MPH_Genes_19880_KSProp.csv", sep = ",", col.names = NA, qmethod = "double")
+
+
+ # ggsave("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/Figures/WithNormFactors/Normfac_Repo_19880_NormAll_ppksprop.pdf", pp_ks_prop, width = 4, height = 4, unit = "in")
+
+```
