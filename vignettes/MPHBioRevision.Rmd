@@ -1,0 +1,1810 @@
+---
+title: "MPHBioRevision"
+author: "YunhuiQi"
+date: "2026-01-13"
+output: html_document
+---
+
+```{r packages}
+library(edgeR)              
+library(limma)              
+library(ggplot2)            
+library(ggfortify)          
+library(variancePartition)  
+library(ggpubr)      
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(tidyverse)
+library(pROC)
+library(DESeq2)
+library(MASS)
+library(nleqslv)
+library(rootSolve)
+library(pracma)
+library(ComplexHeatmap)
+library(pheatmap)
+library(plotly)
+library(cowplot)
+library(DescTools)
+library(glmmTMB)
+library(emmeans)
+library(parallel)
+```
+
+
+```{r functions for 2sLRT}
+Hetero_NB_LRT <- function(y_g1, y_g2, y_g3, C_1 = 1, C_2 = 2, C_3 = 1, dispersion = 1){
+  # This function conducts NB LRT test for heterosis in a single family and for a single gene with single replication per genotype given dispersion parameter
+  # Hg0: mu_g1 + mu_g2 = 2 * mu_g3
+  # @param y_g1: raw count for female
+  # @param y_g2: raw count for male
+  # @param y_g3: raw count for hybrid
+  # @param C_1: normalization factor for female sample
+  # @param C_2: normalization factor for male sample
+  # @param C_3: normalization factor for hybrid sample
+  # @param dispersion: estimation of dispersion parameter
+  # @output pval: pvalue for NB LRT test with known dispersion
+  
+  # rate = 1/dispersion
+  if(dispersion == 0){return(NA)}
+  r <- 1/dispersion
+  
+  # 1. Get MLE under global
+  mu_g_hat1 <- c(y_g1/C_1, y_g2/C_2, y_g3/C_3)
+  
+  # 2. Get MLE under null
+  y_set <- c(y_g1, y_g2, y_g3)
+  C_set <- c(C_1, C_2, C_3)
+  if(sum(y_set) == 0){return(1)}
+  else{
+    equations <- function(mu_set) {
+      eq1 <- y_set[1]/mu_set[1] + y_set[3]/(mu_set[1]+mu_set[2]) - C_1*(r + y_set[1])/(C_1*mu_set[1] + r) - C_3*(r + y_set[3])/(C_3*(mu_set[1] + mu_set[2]) + 2*r)
+      eq2 <- y_set[2]/mu_set[2] + y_set[3]/(mu_set[1]+mu_set[2]) - C_2*(r + y_set[2])/(C_2*mu_set[2] + r) - C_3*(r + y_set[3])/(C_3*(mu_set[1] + mu_set[2]) + 2*r)
+      return(c(eq1, eq2))
+    }
+    
+    init_list <- list(c(ifelse(y_g1 == 0, 10, y_g1), ifelse(y_g2 == 0, 10, y_g2)),
+                      c(y_g1/C_1, y_g2/C_2), c(y_g1/2, y_g2/2),
+                      c(10, 10), c(100, 100), c(2, 2), c(100, 10), c(10, 100),
+                      c(100, 2), c(2, 100))
+
+    # function to check the validity of the solution
+    check_solution <- function(sol) {
+      all(sol$x >= 0) && all(sol$x <= max(c(y_g1, y_g2, y_g3)) * 100) && sol$termcd < 4
+    }
+    
+    # loop through the starting points to find a valid solution
+    sol_found <- FALSE
+    for (inits in init_list) {
+      solution <- nleqslv(x = inits, fn = equations, control = list(maxit = 500))
+      if (check_solution(solution)) {
+        mu_g_hat0 <- c(solution$x, mean(solution$x))
+        sol_found <- TRUE
+        break
+      }
+    }
+    
+    # if no solution is found with nleqslv, use multiroot
+    if (!sol_found) {
+      root <- multiroot(f = equations, start = c(ifelse(y_g1 == 0, 10, y_g1/C_1), ifelse(y_g2 == 0, 10, y_g2/C_2)))
+      if (all(root$root >= 0) && all(root$root <= max(c(y_g1, y_g2, y_g3)) * 100)) {
+        mu_g_hat0 <- c(root$root, mean(root$root))
+      } 
+      else {
+        return(NA) # Or handle the failure to find a solution as appropriate
+      }
+    }
+
+    logL <- function(y_set, C_set, mu_set, r){
+      # under H1, if y_gi!=0, mu_gi!=0, under H0, its very rare to get 0 as MLE
+      if(mu_set[1] == 0){first <- -(r + y_set[1])*log(r + C_set[1]*mu_set[1])}
+      else{first <- y_set[1]*log(mu_set[1]) - (r + y_set[1])*log(r + C_set[1]*mu_set[1])}
+      if(mu_set[2] == 0){second <- -(r + y_set[2])*log(r + C_set[2]*mu_set[2])}
+      else{second <- y_set[2]*log(mu_set[2]) - (r + y_set[2])*log(r + C_set[2]*mu_set[2])}
+      if(mu_set[3] == 0){third <- -(r + y_set[3])*log(r + C_set[3]*mu_set[3])}
+      else{third <- y_set[3]*log(mu_set[3]) - (r + y_set[3])*log(r + C_set[3]*mu_set[3])}
+      return(first + second + third)
+      # Since the choose terms and rlogr and ylogC terms will cancel even with y=0, but it can be greater than the computation can afford  to make computation fail, so we omit them right now
+  }
+  LR <- -2 * (logL(y_set=y_set, C_set = C_set, mu_set = mu_g_hat0, r=r) - logL(y_set=y_set, C_set = C_set, mu_set = mu_g_hat1, r=r))
+  pval <- pchisq(LR, df = 1, lower.tail = FALSE)
+  # return(list(pval=pval, mu_g_hat0 = mu_g1_hat0, mu_g_hat1 = mu_g_hat1))
+  return(pval)
+  }
+}
+Pois_3mean_LRT <- function(y_g1, y_g2, y_g3, C_1 = 1, C_2 = 1, C_3 = 1){
+  # This function conducts Poisson LRT test for non-family in a single family and for a single gene with single replication per genotype
+  # Hg0: mu_g1 = mu_g2 = mu_g3
+  # @param y_g1: raw count for female
+  # @param y_g2: raw count for male
+  # @param y_g3: raw count for hybrid
+  # @param C_1: normalization factor for female sample
+  # @param C_2: normalization factor for male sample
+  # @param C_3: normalization factor for hybrid sample
+  
+  y_set <- c(y_g1, y_g2, y_g3)
+  C_set <- c(C_1, C_2, C_3)
+  mu_g_hat0 <- c(sum(y_set)/sum(C_set), sum(y_set)/sum(C_set), sum(y_set)/sum(C_set))
+  mu_g_hat1 <- c(y_g1/C_1, y_g2/C_2, y_g3/C_3)
+  logL <- function(y_set, C_set, mu_set){
+    # if y_gi != 0, mu_gi != 0, for i=1,2,3
+    if(mu_set[1] == 0){first <- 0}
+    else{first <- y_set[1]*log(mu_set[1]) - C_set[1]*mu_set[1]}
+    if(mu_set[2] == 0){second <- 0 }
+    else{second <- y_set[2]*log(mu_set[2]) - C_set[2]*mu_set[2]}
+    if(mu_set[3] == 0){third <- 0}
+    else{third <- y_set[3]*log(mu_set[3]) - C_set[3]*mu_set[3]}
+    return(first + second + third)
+    #- log(factorial(y_set[1])) - log(factorial(y_set[2])) - log(factorial(y_set[3]))
+    #+ y_set[1]log(C_set[1]) + y_set[2]log(C_set[2]) + y_set[3]log(C_set[3]) 
+    # Since the factorial and ylogC terms will cancel even when y=0, but it can be infinity to make computation fail, so we omit them.
+  }
+  LR <- -2 * (logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat0) - logL(y_set = y_set, C_set = C_set, mu_set = mu_g_hat1))
+  pval <- pchisq(LR, df = 2, lower.tail = FALSE)
+  # return(list(pval=pval, mu_g_hat0 = mu_g1_hat0, mu_g_hat1 = mu_g_hat1))
+  return(pval)
+}
+Disp_est_null_family <- function(counts, group = NULL){
+  # This function estimate the tagwise dispersion parameter for multiple genes with multiple family
+  # @param counts: with genes in rows, and three*n_families columns, female, male and hybrid which passed non-family LRT
+  # @param group: a vector indicating the group information of three*n_families columns
+  if(is.null(group)){
+    y <- DGEList(counts = counts)
+    y <- calcNormFactors(y, method = "RLE")
+    y <- estimateCommonDisp(y)
+    y <- estimateTrendedDisp(y)
+    y <- estimateTagwiseDisp(y)
+  }
+  else{
+    y <- DGEList(counts = counts, group = group) 
+    y <- calcNormFactors(y, method = "RLE")
+    design <- model.matrix(~ group)
+    y <- estimateGLMCommonDisp(y, design)
+    y <- estimateGLMTrendedDisp(y, design)
+    y <- estimateGLMTagwiseDisp(y, design)
+  }
+    return(y$tagwise.dispersion)
+  }
+
+```
+
+# Comparison using Pitz replicated dataset
+
+## 1. Data cleaning
+
+```{r}
+meta_all <- read.table("sample_info_v2.txt", header = TRUE, sep = "\t", fill=TRUE, row.names = "SampleName")
+counts_gen <- read.table("filtered_counts_834_samples.txt",, header = TRUE, sep = "\t", fill=TRUE, row.names = 1)
+all(sort(colnames(counts_gen))==sort(rownames(meta_all)[meta_all$keep_exclude=="keep"]))
+
+counts_pitz <- read.csv("PE_Reads_Table_Gen_pitz.csv",sep = ";", row.names = "Gene_ID")
+colnames(counts_pitz) <- rownames(meta_all)[match(colnames(counts_pitz), meta_all$Sample)]
+
+counts <- counts_pitz[,colnames(counts_gen)]
+rm(counts_pitz, counts_gen)
+
+metadata <- meta_all[colnames(counts),]
+metadata$Batch <- as.factor(metadata$Batch)
+metadata$System <- as.factor(metadata$System)
+metadata$Replicate <- as.factor(metadata$Replicate.Block)
+metadata$Genotype <- as.factor(gsub(" ", "", metadata$Genotype))
+metadata$REP.BAT <- factor(paste(metadata$Replicate, metadata$Batch, sep = "_"))
+metadata$REP.BAT.SYS <- factor(paste(metadata$Replicate, metadata$Batch, metadata$System, sep = "_"))
+
+
+DEGs_pitz <- list.files("/Users/yunhuiqi/Library/Mobile Documents/com~apple~CloudDocs/PhD/academic/2023 Spring/RA/MazeHeterosis/BioPaperRevision/DEGs_LFC1_p05/", pattern = "\\.csv$", full.names = TRUE)
+DEGs_pitz <- setNames(lapply(DEGs_pitz, read.csv, row.names = 1),  sub(".*_([^_]+_[^_]+)\\.csv$", "\\1", basename(DEGs_pitz)))
+DEGs_pitz <- lapply(DEGs_pitz, function(x){x[x$Additivity == "non-additive",]})
+```
+
+
+## 2. Batch and system variation assessment
+
+Evaluation of Technical Noise and Variance Partitioning
+Raw gene count matrices were pre-processed using the edgeR package (Robinson et al., 2010). To ensure consistency with the established analytical framework of the study, we applied the normalization and filtering criteria described by Pitz et al. (2025). Specifically, normalization factors were calculated using the Trimmed Mean of M-values (TMM) method. Lowly expressed genes were subsequently filtered using the filterByExpr function; crucial to this step, we utilized the specific design matrix defined by Pitz et al. (~ 0 + Genotype + REP.BAT), which accounts for the incomplete block design by incorporating the batch factor nested within replicates.
+
+To quantify the contribution of technical covariates to the total gene expression variability, we performed a Variance Component Analysis (VCA) using the variancePartition package (Hoffman and Schadt, 2016). While Pitz et al. modeled the nested "System" effect using duplicateCorrelation within a linear model for differential expression (Eqn 1 in Pitz et al., 2025), we adapted their hierarchical model definition to explicitly partition variance components. The mixed-effects model was specified as expression ~ (1|Replicate) + (1|REP.BAT) + (1|REP.BAT.SYS). This formula mirrors the alpha-design structure described in Pitz et al., where growth systems are nested within batches (REP.BAT.SYS) and batches are nested within replicates (REP.BAT). By treating these hierarchical layers as random effects, we were able to calculate the fraction of variance explained by biological replication versus technical processing layers (Batch and System) for every gene.
+
+```{r}
+#' Evaluate Technical Noise (Pitz et al. Method)
+#'
+#' @param counts_all Raw integer count matrix (Genes x All Samples).
+#' @param meta_all Metadata dataframe (Rows match counts_all columns).
+#' @param target_idx Integer vector indicating which samples to analyze (e.g., Rep 1).
+#' @param vp_formula Formula for variance partition. IMPORTANT: Use the nested names! 
+#'                   e.g., ~ (1|REP.BAT) + (1|REP.BAT.SYS)
+#' @param plot_title String. Label for plots.
+#'
+#' @return List containing plots, stats, and normalized data.
+evaluate_technical_noise <- function(counts_all, 
+                                     meta_all, 
+                                     target_idx, 
+                                     vp_formula, 
+                                     plot_title = "Analysis") {
+  
+
+  # ============================================================================
+  # Global Normalization 
+  # ============================================================================
+  # Justification: Matches Author's Step 1. 
+  # Calculate scaling factors on the full dataset before removing genes.
+  message(">>> Phase 1: Global Normalization (TMM)...")
+  
+  dge <- DGEList(counts = counts_all)
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  
+  # ============================================================================
+  # Filtering using Design Matrix
+  # ============================================================================
+  # Justification: Matches Author's Step 2 & 3.
+  # Using the design matrix (~ Genotype + REP.BAT) is the most robust way 
+  # to filter genes in complex designs.
+  message(">>> Phase 2: Global Filtering using Pitz Design...")
+  
+  # Construct design matrix dynamically
+  # Pitz used: ~ 0 + Genotype + REP.BAT
+  design_str <- "~ 0"
+  if("Genotype" %in% colnames(meta_all)) design_str <- paste(design_str, "+ Genotype")
+  # Important: Use the NESTED batch variable we created
+  design_str <- paste(design_str, "+ REP.BAT")
+  
+  message("    Design formula: ", design_str)
+  design <- model.matrix(as.formula(design_str), data = meta_all)
+  
+  # Filter
+  keep <- filterByExpr(dge, design)
+  dge_clean <- dge[keep, , keep.lib.sizes = FALSE]
+  
+  message("    Original Genes: ", nrow(counts_all))
+  message("    Retained Genes: ", sum(keep))
+  
+  # ============================================================================
+  # PHASE 3: Generate Data & Subset
+  # ============================================================================
+  message(">>> Phase 3: Generating Data & Subsetting...")
+  
+  # Calculate CPM on the CLEAN data
+  # Log2-CPM for Stats/Plots
+  log_data_all <- cpm(dge_clean, normalized.lib.sizes = TRUE, log = TRUE, prior.count = 0.5)
+  # Linear CPM for Output
+  linear_data_all <- cpm(dge_clean, normalized.lib.sizes = TRUE, log = FALSE)
+  
+  # Now Subset to the Target (e.g., B73 or Replicate 1)
+  data_sub_log <- log_data_all[, target_idx]
+  data_sub_linear <- linear_data_all[, target_idx]
+  meta_sub <- meta_all[target_idx, ]
+  
+  # Safety: Drop unused factor levels in the subset
+  meta_sub <- droplevels(meta_sub)
+  
+  # Safety: Remove genes with 0 variance inside this specific subset (prevents PCA crash)
+  gene_vars <- apply(data_sub_log, 1, var)
+  keep_safe <- gene_vars > 1e-6
+  data_clean_log <- data_sub_log[keep_safe, ]
+  data_clean_linear <- data_sub_linear[keep_safe, ]
+  
+  # ============================================================================
+  # PHASE 4: PCA
+  # ============================================================================
+  message(">>> Phase 4: PCA...")
+  
+  pca_res <- prcomp(t(data_clean_log), center = TRUE, scale. = FALSE)
+  pct_var <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+  
+  # Plot using the NESTED variables if possible, or standard Batch/System labels
+  # Note: In Rep 1, "REP.BAT" and "Batch" usually look identical visually
+  p_pca_batch <- autoplot(pca_res, data = meta_sub, colour = "Batch", size = 3) +
+    labs(title = paste0("PCA: ", plot_title),
+         subtitle = "Color: Batch",
+         x = paste0("PC1: ", pct_var[1], "%"), y = paste0("PC2: ", pct_var[2], "%")) +
+    theme_bw() + theme(legend.position = "bottom")
+  
+  p_pca_system <- autoplot(pca_res, data = meta_sub, colour = "System", size = 3) +
+    labs(title = paste0("PCA: ", plot_title),
+         subtitle = "Color: System",
+         x = paste0("PC1: ", pct_var[1], "%"), y = paste0("PC2: ", pct_var[2], "%")) +
+    theme_bw() + theme(legend.position = "bottom")
+  
+  p_pca <- ggarrange(p_pca_batch, p_pca_system, nrow = 1)
+  
+  # ============================================================================
+  # PHASE 5: Variance Partition
+  # ============================================================================
+  message(">>> Phase 5: Variance Partition...")
+  
+  # Fit Model
+  vp_res <- fitExtractVarPartModel(data_clean_log, vp_formula, meta_sub)
+  
+  # Calculate summary stats to help decision making
+  vp_stats <- apply(vp_res, 2, median) * 100
+  
+  p_vp <- plotVarPart(sortCols(vp_res)) +
+    labs(title = paste0("Variance Partition: ", plot_title),
+         subtitle = paste0("Median Batch Effect (REP.BAT): ", 
+                           round(vp_stats[grep("BAT", names(vp_stats))[1]], 2), "%")) +
+    theme_bw()
+  
+  message(">>> Done.")
+  
+  return(list(
+    pca_plot = p_pca,
+    vp_plot = p_vp,
+    vp_results = vp_res,
+    vp_stats = vp_stats,
+    norm_counts = data_clean_linear,
+    log_trans_data = data_clean_log,
+    meta_subset = meta_sub
+  ))
+}
+```
+```{r}
+# 1. All replicates, B73
+eval_B73_all_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "B73"), 
+                         vp_formula = ~ (1|Replicate) + (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "B73 - All replicates - TMM")
+
+# 2. All replicates, Mo17
+eval_Mo17_all_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "Mo17"), 
+                         vp_formula = ~ (1|Replicate) + (1|REP.BAT) + (1|REP.BAT.SYS),
+                         plot_title = "Mo17 - All replicates - TMM")
+
+# 3. Rep 1, B73
+eval_B73_Rep1_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "B73" & metadata$Replicate == "1"), 
+                         vp_formula = ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "B73 - Rep 1 - TMM")
+
+# 4.  Rep 1, Mo17
+eval_Mo17_Rep1_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "Mo17" & metadata$Replicate == "1"), 
+                         vp_formula =  ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "Mo17 - Rep 1 - TMM")
+
+
+# 5. Rep 2, B73
+eval_B73_Rep2_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "B73" & metadata$Replicate == "2"), 
+                         vp_formula =  ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "B73 - Rep 2 - TMM")
+
+# 6.  Rep 2, Mo17
+eval_Mo17_Rep2_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "Mo17" & metadata$Replicate == "2"), 
+                         vp_formula =  ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "Mo17 - Rep 2 - TMM")
+
+# 7. Rep 3, B73
+eval_B73_Rep3_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "B73" & metadata$Replicate == "3"), 
+                         vp_formula =  ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "B73 - Rep 3 - TMM")
+
+# 8.  Rep 3, Mo17
+eval_Mo17_Rep3_TMM <- evaluate_technical_noise(counts_all = counts, 
+                         meta_all = metadata,
+                         target_idx = which(metadata$Genotype == "Mo17" & metadata$Replicate == "3"), 
+                         vp_formula =  ~ (1|REP.BAT) + (1|REP.BAT.SYS), 
+                         plot_title = "Mo17 - Rep 3 - TMM")
+
+```
+```{r}
+round(eval_B73_all_TMM$vp_stats,4)
+round(eval_Mo17_all_TMM$vp_stats,4)
+```
+
+
+## 3. Full family search
+
+To validate our single-replicate method without confounding technical variation, we restricted our analysis to "spatially matched trios" where the hybrid and both parents were processed in the same experimental Batch and grown in the exact same aeroponic System. This strict filtering eliminates temporal and spatial noise, ensuring MPH calculations reflect biological differences. We identified a total of 169 such families available for high-precision validation (39 in Replicate 1, 65 in Replicate 2, and 65 in Replicate 3)
+
+```{r}
+# 1. Initialize an empty list to store the results
+# Using a list is faster than repeatedly using rbind inside a loop
+match_list <- list()
+counter <- 1
+
+# 2. Ensure Genotype column is character type (not factor) to avoid errors
+# metadata$Genotype <- as.character(metadata$Genotype)
+
+metadata$SampleName <- rownames(metadata)
+sample_id_col <- "SampleName" 
+
+# 3. Loop through each unique Biological Replicate
+for (rep in unique(metadata$Replicate)) {
+  
+  # Subset data for the current replicate
+  rep_data <- metadata[metadata$Replicate == rep, ]
+  
+  # Identify Hybrid genotypes: contain an underscore "_"
+  all_gts <- unique(rep_data$Genotype)
+  hyb_gts <- grep("_", all_gts, value = TRUE)
+
+  # Loop through each Hybrid Genotype found in this replicate
+  for (hyb in hyb_gts) {
+    
+    # Extract Parent names from the string (assuming format "Mother_Father")
+    parts <- strsplit(hyb, "_")[[1]]
+    mom_name <- trimws(parts[1]) # Parent 1
+    dad_name <- trimws(parts[2]) # Parent 2
+    
+    # Get all rows for this specific Hybrid genotype in this replicate
+    hyb_rows <- rep_data[rep_data$Genotype == hyb, ]
+    
+    # Loop through each individual Hybrid sample (row)
+    for (i in 1:nrow(hyb_rows)) {
+      
+      # Get specific info for the current hybrid sample
+      curr_hyb_sample <- hyb_rows[i, sample_id_col]
+      curr_batch <- hyb_rows$Batch[i]
+      curr_system <- hyb_rows$System[i]
+      
+      # ---------------------------------------------------------
+      # CORE LOGIC: Find parents in the SAME Replicate, Batch, and System
+      # ---------------------------------------------------------
+      
+      # Find Mother (Parent 1) matches
+      mom_matches <- rep_data[rep_data$Genotype == mom_name & 
+                              rep_data$Batch == curr_batch & 
+                              rep_data$System == curr_system, ]
+      
+      # Find Father (Parent 2) matches
+      dad_matches <- rep_data[rep_data$Genotype == dad_name & 
+                              rep_data$Batch == curr_batch & 
+                              rep_data$System == curr_system, ]
+      
+      # ---------------------------------------------------------
+      # Store Data
+      # ---------------------------------------------------------
+      
+      match_list[[counter]] <- data.frame(
+        Replicate = rep,
+        
+        # Hybrid Info
+        Hybrid_Genotype = hyb,
+        Hybrid_Sample = curr_hyb_sample,
+        Batch = curr_batch,
+        System = curr_system,
+        
+        # Parent 1 (Mother) Info
+        Parent1_Genotype = mom_name,
+        Parent1_Count = nrow(mom_matches), # How many matching samples found
+        # Paste sample names together if there are multiple matches
+        Parent1_Samples = paste(mom_matches[, sample_id_col], collapse = "; "), 
+        
+        # Parent 2 (Father) Info
+        Parent2_Genotype = dad_name,
+        Parent2_Count = nrow(dad_matches),
+        Parent2_Samples = paste(dad_matches[, sample_id_col], collapse = "; "),
+        
+        # Logic Check: TRUE if both parents are found in the same batch/system
+        Full_Match_Found = (nrow(mom_matches) > 0 & nrow(dad_matches) > 0)
+      )
+      
+      counter <- counter + 1
+    }
+  }
+}
+
+# 4. Combine the list into a single Data Frame
+final_tracking_table <- do.call(rbind, match_list)
+
+# 5. Preview results
+meta_family <- final_tracking_table[final_tracking_table$Full_Match_Found == TRUE, ] %>% 
+  mutate(
+    Parent1_Samples_Single = str_remove(Parent1_Samples, ";.*"),
+    Parent2_Samples_Single = str_remove(Parent2_Samples, ";.*")
+  )
+table(meta_family$Replicate)
+```
+
+
+
+
+
+## 4. Apply two stage LRT to a single replicate 
+
+
+For each independent replicate run, we first subsetted the raw count matrix to include only the samples corresponding to the identified spatially matched families (Hybrid, Maternal Parent, Paternal Parent). A pseudo-count of +1 was added to all raw counts to ensure numerical stability in downstream algorithms. We then performed standard preprocessing using the edgeR package: raw counts were normalized using the Trimmed Mean of M-values (TMM) method to account for sequencing depth, and lowly expressed genes were filtered using the filterByExpr function based on Genotype grouping
+
+```{r}
+# ------------------------------------------------------------------------------
+# STEP 1: SUBSET RAW DATA (Crucial Step)
+# ------------------------------------------------------------------------------
+# Isolate single replicate samples from your raw counts and metadata
+# 'target_idx' contains sample names for hybrids in this replicate with its parents are in the same batch and system
+rep_selected <- "1"
+meta_family_rep <- meta_family[meta_family$Replicate == rep_selected, ]
+hybrid_info <- data.frame(hybrid = meta_family_rep$Hybrid_Sample,
+                          female = meta_family_rep$Parent1_Samples_Single,
+                          male = meta_family_rep$Parent2_Samples_Single)
+counts_rep <- counts[, unique(c(hybrid_info$hybrid, hybrid_info$female, hybrid_info$male))] + 1 # we add pseudo count 1 to avoid 0 which will make our algorithm fail.
+meta_rep   <- metadata[colnames(counts_rep), ]
+
+# ------------------------------------------------------------------------------
+# STEP 2: INITIALIZE & NORMALIZE (Pitz Step 1)
+# ------------------------------------------------------------------------------
+# Create DGEList for the single replicate
+# Use Genotype as the group
+dge_rep <- DGEList(counts = counts_rep, group = meta_rep$Genotype)
+
+# Run TMM Normalization, just like Pitz et al.
+dge_rep <- calcNormFactors(dge_rep, method = "TMM")
+
+# ------------------------------------------------------------------------------
+# STEP 3: FILTERING (Pitz Step 2)
+# ------------------------------------------------------------------------------
+# We simply use the group (Genotype) logic which filterByExpr handles automatically.
+
+rep_keep <- filterByExpr(dge_rep, group = meta_rep$Genotype)
+
+# Apply the filter
+# keep.lib.sizes=FALSE ensures library sizes are refreshed after removing genes
+dge_rep_clean <- dge_rep[rep_keep, , keep.lib.sizes = FALSE]
+
+message("Original Genes: ", nrow(counts_rep))
+message("Retained Genes: ", nrow(dge_rep_clean))
+
+# ------------------------------------------------------------------------------
+# STEP 4: GENERATE NORMALIZED DATA
+# ------------------------------------------------------------------------------
+# Get TMM-Normalized CPM (Counts Per Million)
+# This is the input for your method
+norm_data_rep <- cpm(dge_rep_clean, normalized.lib.sizes = TRUE, log = FALSE)
+
+
+
+
+raw_use <- dge_rep_clean$counts # this is the pseudo count
+norm_use <- norm_data_rep
+norm_factors_use <- dge_rep_clean$samples$norm.factors
+names(norm_factors_use) <- rownames(dge_rep_clean$samples)
+```
+
+
+```{r perform 2sLRT on real data, eval = FALSE}
+##### Step 1: Gene-wise pre-test - Poisson LRT for null-family ####
+  gene_test_func <- function(gene){
+  # compute pvalues from test using raw counts and norm factors
+    pval_family <- c()  # for Poisson LRT equal family
+    if(sd(gene) == 0){
+      # if this gene is equally expressed in all varieties
+      pval_family <- rep(1, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      pval_family[hb_num] <- Pois_3mean_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                            C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                            C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                            C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])
+      names(pval_family)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(pval_family = pval_family))
+}
+
+  gene_est_func <- function(gene){
+  # get MP, MPH ratio and diff MPH ratio from normalized data, i.e. estimation of mu_gi under global/Hg1
+    MP <- c()           # mid parents
+    hyb_ratio <- c()    # MPH ratio = hyb/MP
+    diff_ratio <- c()   # MPH diff ratio = (hyb-MP) / MP
+    family_mean <- c()  # family mean 
+    if(all(gene == 0)){
+      # if this gene is not expressed in all varieties
+      MP <- hyb_ratio <- diff_ratio <- family_mean <- rep(0, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      MP[hb_num] <- mean(c(female, male))
+      family_mean[hb_num] <- mean(c(female, male, hybrid))
+      hyb_ratio[hb_num] <- hybrid/(MP[hb_num])
+      diff_ratio[hb_num] <- (hybrid - MP[hb_num]) / (MP[hb_num])
+      names(MP)[hb_num] <- names(family_mean) <- names(hyb_ratio)[hb_num] <- names(diff_ratio)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(MP = MP, family_mean = family_mean, hyb_ratio = hyb_ratio, diff_ratio = diff_ratio))
+  }
+  
+  test_result_list <- lapply(1:nrow(raw_use), function(i) gene_test_func(raw_use[i, ]))
+  est_result_list <- lapply(1:nrow(norm_use), function(i) gene_est_func(norm_use[i, ]))
+
+  
+  # combine genewise pre-test as a matrix, the order of results is consistent of hybrids in hybrid_info.
+  pval_family <- do.call(rbind, lapply(test_result_list, function(x) x$pval_family))
+  MP <- do.call(rbind, lapply(est_result_list, function(x) x$MP))
+  family_mean <- do.call(rbind, lapply(est_result_list, function(x) x$family_mean))
+  diff_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$diff_ratio))
+  hyb_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$hyb_ratio))
+  rownames(pval_family) <- rownames(MP) <- rownames(hyb_ratio) <- rownames(diff_ratio) <- rownames(family_mean) <- rownames(raw_use)
+  colnames(pval_family) <- colnames(MP) <- colnames(hyb_ratio) <- colnames(diff_ratio) <- colnames(family_mean) <- hybrid_info$hybrid
+
+  qval_family <- apply(pval_family, 2, function(x){p.adjust(x, method = "fdr")})
+  
+
+##### Step 2: Estimate dispersion matrix ####
+  # values of tuning parameters
+  gene_groups_no = 1     # number of clusters
+  n_fam_thres = 15       # number of null families threshold for dispersion estimation
+  alpha0 <- 0.1
+
+  null_disp_ind <- qval_family > alpha0
+  DISP <- rep(NA, nrow(null_disp_ind)) # each gene will only have one dispersion estimation
+  names(DISP) <- rownames(null_disp_ind)
+  null_disp_ind_sub <- null_disp_ind[apply(null_disp_ind, 1, function(x) sum(x == 1)) >= n_fam_thres,]
+  jacc_dist <- dist(null_disp_ind_sub, "binary")
+  jacc_hc <- hclust(jacc_dist)
+  jacc_clust <- cutree(jacc_hc, gene_groups_no)
+  cat("Gene clusters size: \n")
+  print(table(jacc_clust))
+  for (i_clust in unique(jacc_clust)) {
+    genes_clust <- rownames(null_disp_ind_sub)[jacc_clust == i_clust]
+    ind_clust <- null_disp_ind_sub[genes_clust,]
+    worst_gene <- genes_clust[which.max(apply(ind_clust, 1, function(x) sum(x==0)))]
+    families_clust <- colnames(null_disp_ind_sub)[null_disp_ind_sub[worst_gene,] == 1]
+    cat(paste("Dispersion estimation for cluster", i_clust, "the number of families is", length(families_clust),", number of genes is ", length(genes_clust)," \n"))
+    counts_clust <- matrix(NA, nrow = length(genes_clust), ncol = 3 * length(families_clust))
+    for(n_hybrid in 1:length(families_clust)){
+      counts_clust[,(n_hybrid - 1) * 3 + 1] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"female"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 2] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"male"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 3] <- raw_use[genes_clust, families_clust[n_hybrid]]
+    }
+    group_clust <- rep(paste("G", 1:length(families_clust), sep = ""), each = 3)
+    DISP[genes_clust] <- Disp_est_null_family(counts = counts_clust, group = group_clust)
+  }
+  cat("Dispersion estimation summary:\n")
+  print(summary(DISP))
+  # #SS2: fit a loess curve to predict the dispersions for genes whose number of all-null families do not reach the minimal requirement all-null families
+    loess_x <- apply(MP, 1, median)
+    x <- loess_x[!is.na(DISP)]
+    y <- DISP[!is.na(DISP)]
+    # cm_G <- intersect(names(y), rownames(dge$counts))
+    # df <- data.frame(
+    #   mine = log10(y[cm_G]),
+    #   theirs = log10(dge$tagwise.dispersion[rownames(dge$counts) %in% names(y)])
+    # )
+    # ggplot(df) +
+    #   geom_point(aes(x=mine, y=theirs), size = 0.5, alpha =0.2)+geom_abline(slope = 1, intercept = 0)+
+    #   annotate(
+    #     "text",
+    #     x = -Inf, y = Inf, hjust = -0.05, vjust = 1.1,
+    #     label = sprintf("CCC = %.3f\nSpearman = %.3f", DescTools::CCC(df$mine, df$theirs)$rho.c$est, cor(df$mine, df$theirs, method = "spearman"))
+    #   )
+    if(sd(x) > 0){
+      new_x <- loess_x[is.na(DISP)]
+      loess_fit <- loess(log(y)~x, span = 0.01)
+      pred_disp <- exp(predict(loess_fit, newdata = new_x))
+      extra <- new_x[is.na(pred_disp) | pred_disp <= 0]
+      intra <- new_x[!is.na(pred_disp) & pred_disp > 0 ]
+      intra_disp <- pred_disp[!is.na(pred_disp) & pred_disp > 0 ]
+      extra_disp <- ifelse(extra < min(x), y[which.min(x)], y[which.max(x)])
+      pred_disp[is.na(pred_disp) | pred_disp <= 0] <- extra_disp
+      DISP[is.na(DISP)] <- pred_disp
+      }
+    dispersion_mat <- matrix(DISP, nrow = nrow(raw_use), ncol = nrow(hybrid_info))
+    colnames(dispersion_mat) <- hybrid_info$hybrid
+    rownames(dispersion_mat) <- rownames(raw_use)
+    # cm_G <- intersect(names(c(y, pred_disp[!is.na(pred_disp)])), rownames(dge$counts))
+    # df <- data.frame(
+    #   mine = log10(c(y,pred_disp)[cm_G]),
+    #   theirs = log10(dge$tagwise.dispersion[rownames(dge$counts) %in% cm_G])
+    # )
+    # ggplot(df) +
+    #   geom_point(aes(x=mine, y=theirs), size = 0.5, alpha =0.2)+geom_abline(slope = 1, intercept = 0)+
+    #   annotate(
+    #     "text",
+    #     x = -Inf, y = Inf, hjust = -0.05, vjust = 1.1,
+    #     label = sprintf("CCC = %.3f\nSpearman = %.3f", DescTools::CCC(df$mine, df$theirs)$rho.c$est, cor(df$mine, df$theirs, method = "spearman"))
+    #   )
+##### Step 3: NB estimation with known dispersion matrix ####
+  NB_gene_func <- function(gene_ind){
+    gene <- raw_use[gene_ind,]
+    gene_name <- rownames(raw_use)[gene_ind]
+    pval <- c()
+    if(sd(gene) == 0){pval <- rep(1, nrow(hybrid_info))}
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      dispersion <- dispersion_mat[gene_name, hybrid_info$hybrid[hb_num]]
+      if(dispersion == 0){pval[hb_num] <- Hetero_Pois_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                                          C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                                          C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                                          C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])}
+      else{pval[hb_num] <- Hetero_NB_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                         C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                         C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                         C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]],
+                                         dispersion = dispersion)}
+      names(pval)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(pval)
+  }
+  
+  pval_NB <- do.call(rbind, lapply(1:nrow(raw_use),  NB_gene_func))
+  rownames(pval_NB) <- rownames(raw_use)
+  qval_NB <- apply(pval_NB, 2, function(x){p.adjust(x, method = "fdr")})
+```
+
+
+
+
+
+## 5. Test MPH with replicates
+
+
+```{r}
+rep_reps <- rownames(metadata)[metadata$Genotype %in% meta_rep$Genotype]
+counts_rep_rep <- counts[, rep_reps]
+meta_rep_rep <- droplevels(metadata[rep_reps,])
+```
+
+
+```{r}
+# ==============================================================================
+# PART 1: PREPROCESSING AND ESTIMATION OF DISPERSION
+# ==============================================================================
+
+# 1. Create DGEList
+dge <- DGEList(counts = counts_rep_rep)
+
+# 2. Normalization (TMM)
+dge <- calcNormFactors(dge)
+
+# 3. Filtering
+# MATRIX 1: Just Biology. We want to keep genes expressed in any Genotype.
+design_filter <- model.matrix(~ Genotype, data = meta_rep_rep)
+keep <- filterByExpr(dge, design_filter)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+
+# 4. Dispersion Estimation
+# MATRIX 2: Biology + Technical. We need to subtract Batch noise to find real Dispersion.
+# Note: Treat Batch as Fixed here to help edgeR "clean" the variance.
+design_disp <- model.matrix(~ Genotype + REP.BAT, data = meta_rep_rep)
+# design <- model.matrix(
+#   ~ 0 + as.factor(sampleinfo$Genotype) + as.factor(sampleinfo$REP.BAT) # REP.BAT for batch nested within replicate
+# ) this is from the author's code
+dge <- estimateDisp(dge, design_disp)
+
+# 5. Extract the "Clean" Dispersion for glmmTMB
+# edgeR gives 'dispersion' (phi). glmmTMB wants 'theta' (size).
+# Relationship: theta = 1 / phi
+gene_thetas <- 1 / dge$tagwise.dispersion
+names(gene_thetas) <- rownames(dge$counts)
+
+
+# ==============================================================================
+# PART 2: BUILD THE MASTER CONTRAST LIST (Run Once)
+# ==============================================================================
+
+# Get all genotype levels exactly as they appear in the factor
+all_levs <- levels(meta_rep_rep$Genotype)
+
+# Identify Hybrid names (assuming they contain underscores or specific pattern)
+# Adjust pattern if needed. Here I assume Hybrids have "_"
+hybrid_names <- grep("_", all_levs, value = TRUE) 
+
+# Generate the list of numeric vectors
+master_contrast_list <- setNames(lapply(hybrid_names, function(h) {
+  
+  # Logic: "B73_ M0001" -> c("B73", "M0001")
+  # Uses trimws() to handle spaces like " M0001"
+  parents <- trimws(unlist(strsplit(h, "_")))
+  
+  # Check if both parents exist in the dataset
+  if(!all(parents %in% all_levs)) return(NULL)
+  
+  # Create zero vector
+  vec <- setNames(numeric(length(all_levs)), all_levs)
+  
+  # Set arithmetic MPH coefficients: Hybrid - 0.5*P1 - 0.5*P2
+  vec[h] <- 1
+  vec[parents] <- -0.5
+  
+  return(vec)
+}), hybrid_names)
+
+# Remove any hybrids where parents weren't found (remove NULLs)
+master_contrast_list <- master_contrast_list[!sapply(master_contrast_list, is.null)]
+
+print(paste("Created contrasts for", length(master_contrast_list), "hybrids."))
+
+# ==============================================================================
+# PART 3: THE GENE WORKER FUNCTION
+# ==============================================================================
+
+run_all_families_test <- function(count_vec, theta_fixed, metadata, contrast_list) {
+  
+  df_tmp <- data.frame(Count = as.numeric(count_vec) + 1, # This is to avoid convergence problem in glmmTMB 
+                       Genotype = metadata$Genotype,
+                       REP.BAT = metadata$REP.BAT,
+                       REP.BAT.SYS = metadata$REP.BAT.SYS)
+  
+  # A. Try Full Model (System Random Effect)
+  fit <- tryCatch({
+    glmmTMB(Count ~ Genotype + REP.BAT + (1|REP.BAT.SYS), 
+            data = df_tmp, 
+            family = nbinom2,
+            start = list(betadisp = log(theta_fixed)), 
+            map = list(betadisp = factor(NA)),
+            control = glmmTMBControl(optCtrl=list(iter.max=1000, eval.max=1000))
+    )
+  }, error = function(e) return(NULL))
+  
+  # B. Fallback: If Full Model fails (Singular fit / Convergence), try Simple Model
+  if(is.null(fit)) {
+    fit <- tryCatch({
+      glmmTMB(Count ~ Genotype + REP.BAT, 
+              data = df_tmp, 
+              family = nbinom2,
+              start = list(betadisp = log(theta_fixed)), 
+              map = list(betadisp = factor(NA))
+      )
+    }, error = function(e) return(NULL))
+  }
+  
+  # C. If both fail, return NAs
+  if(is.null(fit)) return(rep(NA, length(contrast_list)))
+  
+  # D. Calculate Stats
+  # Wrap in tryCatch because emmeans can fail on very weird fits
+  pvals <- tryCatch({
+    emm <- emmeans(fit, ~ Genotype)
+    emm_arith <- regrid(emm) # Transform to arithmetic scale
+    
+    # Run ALL contrasts simultaneously
+    res <- contrast(emm_arith, method = contrast_list)
+    
+    # Return just the p-values as a named vector
+    s <- summary(res)
+    stats <- s$p.value
+    names(stats) <- s$contrast
+    return(stats)
+    
+  }, error = function(e) return(rep(NA, length(contrast_list))))
+  
+  return(pvals)
+}
+
+# ==============================================================================
+# PART 4: RUN THE LOOP (Parallel) AND FORMAT OUTPUT
+# ==============================================================================
+
+
+# 1. Detect your total cores
+total_cores <- detectCores()
+
+# 2. Decide how many to use
+# Best Practice: Use (Total - 1) or (Total - 2) so your computer doesn't freeze.
+# If you have 8 cores, use 6 or 7.
+use_cores <- max(1, total_cores - 2)
+
+print(paste("Your system has", total_cores, "cores."))
+print(paste("Using", use_cores, "cores for processing."))
+
+# Extract the clean count matrix
+count_matrix <- dge$counts
+
+# Run in parallel (Adjust mc.cores based on your CPU)
+# Use mc.cores = 1 if on Windows
+results_replicates <- mclapply(seq_len(nrow(count_matrix)), function(i) {
+  
+  gene_id <- rownames(count_matrix)[i]
+  theta   <- gene_thetas[gene_id]
+  counts  <- count_matrix[i, ]
+  
+  # Run function
+  run_all_families_test(counts, theta, meta_rep_rep, master_contrast_list)
+  
+}, mc.cores = use_cores) 
+
+# ==============================================================================
+# PART 5: CONVERT LIST TO MATRIX
+# ==============================================================================
+
+# Bind rows together
+pval_replicates <- do.call(rbind, results_replicates)
+
+# Assign Gene Names to Rows
+rownames(pval_replicates) <- rownames(dge$counts)
+
+# Check dimensions
+print(dim(pval_replicates))
+# Should be: [Number of Genes] x [Number of Hybrids]
+
+# Preview
+head(pval_replicates)
+```
+
+## 6. Results comparison 
+
+
+```{r}
+generate_deep_diagnosis <- function(target_family, 
+                                    counts_matrix, 
+                                    metadata, 
+                                    hybrid_info, 
+                                    disp_dat_mine,   
+                                    disp_dat_theirs,
+                                    fdr_mine_full,    
+                                    fdr_theirs_full,
+                                    common_genes,
+                                    alpha = 0.05) {
+  
+  # --- 1. SETUP: FIND SAMPLE IDs ---
+  parents <- trimws(unlist(strsplit(target_family, "_")))
+  
+  # Robust Lookup: Get the column name passed in the 1-col matrix
+  sample_name_in_matrix <- colnames(fdr_mine_full)
+  match_idx <- which(hybrid_info$hybrid == sample_name_in_matrix)
+  
+  if(length(match_idx) == 0) stop(paste("Sample", sample_name_in_matrix, "not found in hybrid_info"))
+  
+  my_hybrid_id <- hybrid_info$hybrid[match_idx]
+  my_female_id <- hybrid_info$female[match_idx]
+  my_male_id   <- hybrid_info$male[match_idx]
+  
+  # Find Their Replicates
+  all_hybrid_reps <- rownames(metadata)[metadata$Genotype == target_family | metadata$Genotype == gsub("_", "x", target_family)]
+  all_p1_reps     <- rownames(metadata)[metadata$Genotype == parents[1]]
+  all_p2_reps     <- rownames(metadata)[metadata$Genotype == parents[2]]
+  
+  # --- 2. SUBSET DATA ---
+  # Ensure we only work on the intersected genes passed to the function
+  mat <- counts_matrix[common_genes, c(all_hybrid_reps, all_p1_reps, all_p2_reps)]
+  
+  # --- 3. CALCULATE METRICS ---
+  
+  # Mine (Single Rep)
+  my_val_h   <- mat[common_genes, my_hybrid_id]
+  my_val_f   <- mat[common_genes, my_female_id]
+  my_val_m   <- mat[common_genes, my_male_id]
+  my_val_min <- pmin(my_val_h, my_val_f, my_val_m)
+  my_val_mp  <- (my_val_f + my_val_m) / 2
+  
+  my_mph_raw <- my_val_h - my_val_mp
+  my_mph     <- (my_val_h - my_val_mp) / (my_val_mp) 
+  
+  my_fdr     <- fdr_mine_full[common_genes, 1] # Take the data from the single column
+  my_disp    <- disp_dat_mine[common_genes, "Dispersion"]
+  
+  # Theirs (Benchmark Means)
+  their_mean_h  <- rowMeans(mat[common_genes, all_hybrid_reps, drop=FALSE])
+  their_mean_f  <- rowMeans(mat[common_genes, all_p1_reps, drop=FALSE]) 
+  their_mean_m  <- rowMeans(mat[common_genes, all_p2_reps, drop=FALSE]) 
+  their_mean_mp <- (their_mean_f + their_mean_m) / 2
+  
+  their_mph_raw <- their_mean_h - their_mean_mp
+  their_mph     <- (their_mean_h - their_mean_mp) / (their_mean_mp)
+  
+  their_fdr     <- fdr_theirs_full[common_genes, target_family]
+  their_disp    <- disp_dat_theirs[common_genes, "Dispersion"]
+  
+  # Noise Check (Max CV of family)
+  calc_cv <- function(sub_mat) apply(sub_mat, 1, function(x) sd(x)/mean(x))
+  max_cv <- pmax(calc_cv(mat[common_genes, all_hybrid_reps, drop=FALSE]), 
+                 calc_cv(mat[common_genes, all_p1_reps, drop=FALSE]), 
+                 calc_cv(mat[common_genes, all_p2_reps, drop=FALSE]), na.rm=TRUE)
+  
+  # Deviations
+  dev_h <- abs(my_val_h - their_mean_h) / (their_mean_h + 1)
+  dev_f <- abs(my_val_f - their_mean_f) / (their_mean_f + 1)
+  dev_m <- abs(my_val_m - their_mean_m) / (their_mean_m + 1)
+  
+  # --- 4. CLASSIFICATIONS ---
+  sig_m <- my_fdr < alpha & !is.na(my_fdr)
+  sig_t <- their_fdr < alpha & !is.na(their_fdr)
+  
+  class_vec <- rep("TN", length(common_genes))
+  class_vec[sig_m & sig_t]  <- "TP"
+  class_vec[sig_m & !sig_t] <- "FP"
+  class_vec[!sig_m & sig_t] <- "FN"
+  
+  # --- 5. DIAGNOSTICS FLAGS ---
+  
+  # Flag 1: Dispersion Underestimation (The cause of FP)
+  # Logic: My estimate was < 0.2 (Stable), Reality was > 0.4 (Noisy)
+  flag_disp_low <- (my_disp < 0.2) & (their_disp > 0.4)
+  # other side
+  flag_disp_high <- my_disp > (2 * their_disp)
+  
+  # Flag 2: High Noise
+  flag_noise <- (max_cv > 0.5)
+  
+  # Flag 3: Outlier Sample
+  # Logic: My Effect > 2x Their Effect 
+  flag_outlier_high <- (abs(my_mph) > (2 * abs(their_mph)))
+  flag_outlier_low <- abs(my_mph) < (0.5 * abs(their_mph))
+
+  # Flag 4: Low Counts
+  flag_low <- my_val_min < 10
+  
+  # Flag 5: Weak Signal (Practical Filter)
+  flag_weak <- abs(my_mph) < 0.5 # h/mp in (0.5, 1.5)
+  
+  
+  # Flag 5: Confident calls 
+  flag_confident <- abs(their_mph) > 0.2 #(their_mph > 2) | (their_mph < -2/3)
+  
+  # Construct Reason String
+  is_fp <- class_vec == "FP"
+  reason_vec <- rep(NA, length(common_genes))
+  reason_vec[is_fp] <- paste0(
+    ifelse(flag_disp_low[is_fp],    "DispersionError + ", ""),
+    ifelse(flag_noise[is_fp],   "HighNoise + ", ""),
+    ifelse(flag_outlier_high[is_fp], "Outlier + ", ""),
+    ifelse(flag_low[is_fp],     "LowCount + ", "")
+  )
+  reason_vec <- sub(" \\+ $", "", reason_vec)
+  reason_vec[is_fp & reason_vec == ""] <- "Unknown"
+  
+
+  
+  is_fn <- class_vec == "FN"
+  fn_reason_vec <- rep(NA, length(common_genes))
+  fn_reason_vec[is_fn] <- paste0(
+    ifelse(flag_low[is_fn],         "LowCount + ", ""),
+    ifelse(flag_outlier_low[is_fn], "SignalDilution + ", ""),
+    ifelse(flag_disp_high[is_fn],   "DispOverestimation + ", "")
+  )
+  fn_reason_vec <- sub(" \\+ $", "", fn_reason_vec)
+  fn_reason_vec[is_fn & fn_reason_vec == ""] <- "Unknown"
+  
+  # --- 6. SUBSET DEFINITIONS ---
+  
+  # Subset A: Quantifiable
+  flag_quantifiable <- !flag_low
+  
+  # Subset B: Quantifiable + Strong
+  flag_quantifiable_strong <- flag_quantifiable & !flag_weak
+  
+  # Subset C: Representative (The Gold Standard)
+  # Must be Strong, Quantifiable, Accurate (Dev < 0.5), and Stable (CV < 0.5)
+  flag_representative <- flag_quantifiable_strong & 
+                         (dev_h < 0.5) & (dev_f < 0.5) & (dev_m < 0.5) & 
+                         (max_cv < 0.5)
+  
+  flag_disp_correct <- !flag_disp_high & !flag_disp_low
+  flag_signal_correct <- !flag_outlier_high & !flag_outlier_low
+
+  
+  # --- 7. ASSEMBLE ---
+  df <- data.frame(
+    Hybrid = target_family, 
+    Gene = common_genes,
+    
+    # Subsets
+    Is_Quantifiable = flag_quantifiable,
+    Is_Quantifiable_Strong = flag_quantifiable_strong,
+    Is_Representative = flag_representative,
+    Is_Disp_Correct = flag_disp_correct,
+    Is_Signal_Correct = flag_signal_correct,
+    Is_Count_Close =  (dev_h < 0.5) & (dev_f < 0.5) & (dev_m < 0.5),
+    Is_Rep_Confidenct = flag_confident,
+    
+    # Result
+    Classification = class_vec,
+    FP_Reason_Str = reason_vec, 
+    
+    # Flags
+    Is_Disp_High = flag_disp_high,
+    Is_Disp_Low = flag_disp_low,
+    Is_High_Noise = flag_noise,
+    Is_Outlier_High  = flag_outlier_high,
+    Is_Outlier_Low = flag_outlier_low,
+    Is_Low_Count  = flag_low,
+    Is_Weak = flag_weak,
+    
+    
+    # Data
+    My_FDR = my_fdr, Their_FDR = their_fdr,
+    My_MPH = my_mph, Their_MPH = their_mph,
+    My_MPH_Raw = my_mph_raw, Their_MPH_Raw = their_mph_raw,
+    My_Disp = my_disp, Their_Disp = their_disp,
+    My_Hybrid_Count = my_val_h, Their_Hybrid_Mean = their_mean_h,
+    My_Female_Count = my_val_f, Their_Female_Mean = their_mean_f,
+    My_Male_Count = my_val_m, Their_Male_Mean = their_mean_m,
+    My_MP = my_val_mp, Their_MP = their_mean_mp,
+    
+    Their_CV  = max_cv # We return the Max CV of the family
+  )
+  
+  return(df)
+}
+
+
+
+
+get_performance_metrics <- function(df, stage_name) {
+  
+  # 1. Classification Metrics (Cutoff based)
+  TP <- sum(df$Classification == "TP")
+  FP <- sum(df$Classification == "FP")
+  FN <- sum(df$Classification == "FN")
+  
+  precision <- ifelse((TP+FP)==0, 0, TP / (TP + FP))
+  recall    <- ifelse((TP+FN)==0, 0, TP / (TP + FN))
+  
+  # Filter for valid data
+  valid_cor <- df %>% filter(!is.na(My_FDR) & !is.na(Their_FDR))
+  
+  # 2. Ranking Metrics
+  spearman  <- cor(valid_cor$My_FDR, valid_cor$Their_FDR, method = "spearman")
+  
+  # CCC
+  log_mine   <- -log10(pmax(valid_cor$My_FDR, 1e-300))
+  log_theirs <- -log10(pmax(valid_cor$Their_FDR, 1e-300))
+  ccc_val    <- CCC(log_mine, log_theirs)$rho.c$est
+  
+  # 3. AUC CALCULATION (New)
+  # Define Truth: Did the Benchmark call it Significant?
+  # Truth = 1 (TP or FN), False = 0 (FP or TN)
+  truth_labels <- valid_cor$Classification %in% c("TP", "FN")
+  
+  # Define Prediction Score: We use (1 - FDR) so high score = high confidence
+  pred_scores  <- 1 - valid_cor$My_FDR
+  
+  auc_val <- NA
+  # AUC requires both True and False cases to exist in the data
+  if (length(unique(truth_labels)) == 2) {
+    # Suppress messages/warnings from pROC
+    roc_obj <- tryCatch({
+      roc(response = truth_labels, predictor = pred_scores, quiet = TRUE, direction = "<")
+    }, error = function(e) return(NULL))
+    
+    if(!is.null(roc_obj)) {
+      auc_val <- as.numeric(roc_obj$auc)
+    }
+  }
+  
+  # 4. TOP 10000 OVERLAP
+  valid_cor$UniqueID <- paste0(valid_cor$Gene, "_", valid_cor$Hybrid)
+  top_n <- min(10000, nrow(valid_cor))
+  
+  my_top_ids <- valid_cor %>% arrange(My_FDR) %>% head(top_n) %>% pull(UniqueID)
+  their_top_ids <- valid_cor %>% arrange(Their_FDR) %>% head(top_n) %>% pull(UniqueID)
+  
+  top_overlap <- length(intersect(my_top_ids, their_top_ids)) / top_n
+  
+  return(data.frame(
+    Stage       = stage_name,
+    N_Pairs     = nrow(df),
+    Precision   = round(precision * 100, 1),
+    Recall      = round(recall * 100, 1),
+    AUC         = round(auc_val, 3),          
+    Spearman    = round(spearman, 3),
+    CCC_LogP    = round(ccc_val, 3),
+    Top10000_Ovrl = round(top_overlap * 100, 1)
+  ))
+}
+```
+
+
+
+```{r}
+# ==============================================================================
+# PHASE 1: FIND THE BEST REPLICATE (Correct FDR Order)
+# ==============================================================================
+
+# 1. Start with FULL Raw P-value Matrices
+raw_mine_full   <- pval_NB
+raw_theirs_full <- pval_replicates
+
+# 2. Calculate FDR on FULL Data 
+fdr_mine_full   <- apply(raw_mine_full, 2, p.adjust, method = "BH")
+fdr_theirs_full <- apply(raw_theirs_full, 2, p.adjust, method = "BH")
+
+# 3. NOW Intersect Genes (Subset the FDR matrices, not the P-value matrices)
+common_genes <- intersect(rownames(fdr_mine_full), rownames(fdr_theirs_full))
+common_genes <- intersect(common_genes, names(y))
+
+# Subset the FDR matrices
+fdr_mine_sub   <- fdr_mine_full[common_genes, ]
+fdr_theirs_sub <- fdr_theirs_full[common_genes, ]
+
+# 4. Build Mapping Table (Same as before)
+original_names <- colnames(fdr_mine_sub)
+target_names   <- gsub("x", "_", sub("_.*", "", original_names)) 
+valid_targets  <- gsub(" ", "", colnames(fdr_theirs_sub))
+colnames(fdr_theirs_sub) <- valid_targets
+
+mapping_df <- data.frame(Sample = original_names, Target = target_names, stringsAsFactors = F) %>%
+  filter(Target %in% valid_targets)
+
+# 5. Loop to Score Replicates (Using pre-calculated FDRs)
+scores_list <- lapply(1:nrow(mapping_df), function(i) {
+  samp <- mapping_df$Sample[i]
+  targ <- mapping_df$Target[i]
+  
+  # Use the SUBSETTED FDR matrices here
+  fdr_m <- fdr_mine_sub[, samp]
+  fdr_t <- fdr_theirs_sub[, targ]
+  
+  TP <- sum(fdr_m < 0.05 & fdr_t < 0.05, na.rm=T)
+  FP <- sum(fdr_m < 0.05 & fdr_t >= 0.05, na.rm=T)
+  FN <- sum(fdr_m >= 0.05 & fdr_t < 0.05, na.rm=T)
+  
+  prec <- ifelse((TP+FP)==0, 0, TP/(TP+FP))
+  rec  <- ifelse((TP+FN)==0, 0, TP/(TP+FN))
+  f1   <- ifelse((prec+rec)==0, 0, 2*(prec*rec)/(prec+rec))
+  
+  return(data.frame(Sample=samp, Target=targ, F1=f1))
+})
+
+# 6. Pick Winners
+best_reps <- do.call(rbind, scores_list) %>% group_by(Target) %>% arrange(desc(F1)) %>% slice(1) %>% ungroup()
+
+# 7. Create CLEAN FDR Matrix for Phase 2
+# We pull the specific columns from the ALREADY adjusted matrix
+fdr_mine_clean <- fdr_mine_sub[, best_reps$Sample]
+colnames(fdr_mine_clean) <- best_reps$Target
+
+# Clean Benchmark Matrix
+fdr_theirs_clean <- fdr_theirs_sub[, best_reps$Target]
+# ==============================================================================
+# 3. RUN DIAGNOSTIC LOOP
+# ==============================================================================
+
+# Prepare Dispersion Data (Ensuring alignment)
+disp_dat_mine <- data.frame(Dispersion=c(y, intra_disp, extra_disp), MP=c(x, intra, extra),
+                            type = factor(rep(c("Estimated","Predicted","Extrapolated"), 
+                                              c(length(x), length(intra), length(extra))), 
+                                          levels = c("Estimated","Predicted","Extrapolated")))
+disp_dat_theirs <- data.frame(Dispersion = dge$tagwise.dispersion, Type = "Estimated", row.names = rownames(dge$counts))
+
+disp_dat_mine <- disp_dat_mine[common_genes,]
+disp_dat_theirs <- disp_dat_theirs[common_genes,]
+
+all_diag_list <- lapply(colnames(fdr_mine_clean), function(target_family) {
+  tryCatch({
+    # Lookup the specific Sample ID for this Family
+    my_sample_id <- best_reps$Sample[best_reps$Target == target_family]
+    
+    # Create 1-col matrix with Sample ID Name
+    fdr_vec <- fdr_mine_clean[, target_family]
+    fdr_mine_input <- matrix(fdr_vec, ncol=1, dimnames=list(names(fdr_vec), my_sample_id))
+    
+    generate_deep_diagnosis(
+      target_family   = target_family,
+      counts_matrix   = dge$counts[common_genes,]+1,
+      metadata        = metadata,
+      hybrid_info     = hybrid_info,
+      disp_dat_mine   = disp_dat_mine,
+      disp_dat_theirs = disp_dat_theirs, 
+      fdr_mine_full   = fdr_mine_input, 
+      fdr_theirs_full = fdr_theirs_clean,
+      common_genes    = common_genes,
+      alpha = 0.1
+    )
+  }, error = function(e) { warning(e); return(NULL) })
+})
+
+master_diagnosis_df <- do.call(rbind, all_diag_list[!sapply(all_diag_list, is.null)])
+
+# ==============================================================================
+# 4. REPORT GENERATION
+# ==============================================================================
+
+# Generate Rows
+r1 <- get_performance_metrics(master_diagnosis_df, "1. Raw Output")
+r2 <- get_performance_metrics(subset(master_diagnosis_df, Is_Quantifiable), "2. Remove low count (min<10)")
+r3 <- get_performance_metrics(subset(master_diagnosis_df, Is_Quantifiable_Strong), "3. Remove low count and weak signal(h=(0.5, 1.5)mp) ")
+r4 <- get_performance_metrics(subset(master_diagnosis_df, Is_Representative), "4. Remove low count and weak signal and noisy(cv>0.5)")
+r5 <- get_performance_metrics(subset(master_diagnosis_df, Is_Disp_Correct), "5. Remove Disp Error")
+r6 <- get_performance_metrics(subset(master_diagnosis_df, Is_Signal_Correct), "6. Remove Outliers")
+r7 <- get_performance_metrics(subset(master_diagnosis_df, Is_Count_Close), "7. Remove Not Similar Counts")
+
+
+final_table <- rbind(r1, r2, r3, r4, r5, r6, r7)
+final_table$Data_Remaining_Pct <- round(final_table$N_Pairs / nrow(master_diagnosis_df) * 100, 1)
+
+print(final_table)
+```
+
+```{r}
+r1 <- get_performance_metrics(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), "1. Raw Output")
+r2 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Quantifiable), "2. Remove low count (min<10)")
+r3 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Quantifiable_Strong), "3. Remove low count and weak signal(absmph<0.3) ")
+r4 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Representative), "4. Remove low count and weak signal and noisy(cv>0.5)")
+r5 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Disp_Correct), "5. Remove Disp Error")
+r6 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Signal_Correct), "6. Remove Outliers")
+r7 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Count_Close), "7. Remove Not Similar Counts")
+
+
+final_table <- rbind(r1, r2, r3, r4, r5, r6, r7)
+final_table$Data_Remaining_Pct <- round(final_table$N_Pairs / nrow(master_diagnosis_df) * 100, 1)
+
+print(final_table)
+```
+
+
+# Comparison using in house replicated dataset
+
+We drop sample B18.2nd, and B21.2nd to make sure we have two replicates per genotype
+
+
+```{r}
+
+logLik_NB <- function(y, C, mu, r) { sum(y * log(C * mu) - (y + r) * log(C * mu + r)) }
+score_NB  <- function(y, C, mu, r) { sum( (y / mu) - ((y + r) * C) / (C * mu + r) ) }
+hessian_NB<- function(y, C, mu, r) { sum( -(y / mu^2) + ((y + r) * C^2) / (C * mu + r)^2 ) }
+
+solve_H1_1D <- function(y, C, r) {
+  mu <- sum(y) / sum(C)
+  if(is.nan(mu) || mu == 0) return(1e-4)
+  for(k in 1:25) {
+    S <- score_NB(y, C, mu, r); H <- hessian_NB(y, C, mu, r)
+    step <- S / H
+    mu_new <- mu - step
+    iter_half <- 0
+    while(mu_new <= 0 && iter_half < 10) { step <- step * 0.5; mu_new <- mu - step; iter_half <- iter_half + 1 }
+    if(mu_new <= 0) mu_new <- 1e-5
+    if(abs(mu_new - mu) < 1e-6 * mu) return(mu_new)
+    mu <- mu_new
+  }
+  return(mu)
+}
+
+test_Family_LRT <- function(y_list, C_list, phi) {
+  r <- 1/phi
+  mu_hat <- numeric(3); logL_H1 <- 0
+  for(i in 1:3) {
+    mu_hat[i] <- solve_H1_1D(y_list[[i]], C_list[[i]], r)
+    logL_H1 <- logL_H1 + logLik_NB(y_list[[i]], C_list[[i]], mu_hat[i], r)
+  }
+
+  theta <- c(mu_hat[1], mu_hat[2])
+  for(iter in 1:25) {
+    m1 <- theta[1]; m2 <- theta[2]; m3 <- (m1 + m2)/2
+    d1 <- c(score_NB(y_list[[1]],C_list[[1]],m1,r), hessian_NB(y_list[[1]],C_list[[1]],m1,r))
+    d2 <- c(score_NB(y_list[[2]],C_list[[2]],m2,r), hessian_NB(y_list[[2]],C_list[[2]],m2,r))
+    d3 <- c(score_NB(y_list[[3]],C_list[[3]],m3,r), hessian_NB(y_list[[3]],C_list[[3]],m3,r))
+
+    grad <- c(d1[1] + 0.5*d3[1], d2[1] + 0.5*d3[1])
+    H11 <- d1[2] + 0.25*d3[2]; H22 <- d2[2] + 0.25*d3[2]; H12 <- 0.25*d3[2]
+
+    det <- H11*H22 - H12*H12
+    if(abs(det) < 1e-10) break
+    delta1 <- (H22*grad[1] - H12*grad[2])/det
+    delta2 <- (-H12*grad[1] + H11*grad[2])/det
+
+    theta_new <- theta - c(delta1, delta2)
+    step_size <- 1
+    while(any(theta_new <= 0) && step_size > 1e-4) {
+      step_size <- step_size * 0.5
+      theta_new <- theta - (c(delta1, delta2) * step_size)
+    }
+    if(max(abs(theta_new - theta)) < 1e-5) { theta <- theta_new; break }
+    theta <- theta_new
+  }
+  logL_H0 <- logLik_NB(y_list[[1]],C_list[[1]],theta[1],r) +
+    logLik_NB(y_list[[2]],C_list[[2]],theta[2],r) +
+    logLik_NB(y_list[[3]],C_list[[3]],(theta[1]+theta[2])/2,r)
+
+  LRT <- 2 * (logL_H1 - logL_H0)
+  if(LRT < 0 || is.na(LRT)) LRT <- 0
+  return(pchisq(LRT, df=1, lower.tail=FALSE))
+}
+```
+
+## 1. Replicated analysis
+```{r}
+samples2exclude <- c("B18.2nd", "B21.2nd")
+data_rep <- read.table("small_family_size/allSamples.featurecounts.add2nd.txt", sep = "\t", header = TRUE, row.names = "Geneid")
+# load("../IntermediateRes/WithNormFactors/Normfac_NBpqvalue_19880.RData")
+group_info <- read.table("small_family_size/group_info.txt", sep = "\t", header=TRUE)
+group_info <- group_info %>%
+  mutate(Genotype = gsub("X", "/", Condition)) %>%
+  subset(!(ID %in% samples2exclude))%>%
+  { 
+    rownames(.) <- .$ID
+    .
+  }
+
+hybrid_info <- group_info %>%
+  filter(grepl("/", Genotype)) %>%
+  mutate(hybrid = Genotype) %>%
+  separate(
+    col   = Genotype,
+    into  = c("female", "male"),
+    sep   = "/",
+    remove = TRUE
+  ) %>%
+  select(hybrid, female, male) %>%
+  distinct() %>%
+  { 
+    rownames(.) <- NULL
+    .
+  }
+
+
+
+counts <- data_rep[,group_info$ID]
+
+Big_C <- DESeq2::estimateSizeFactorsForMatrix(counts); if(any(is.na(Big_C))) Big_C[] <- 1
+
+# valid_genes <- intersect(rownames(pval_NB),rownames(counts))
+
+valid_genes <- rownames(counts)[apply(counts, 1, function(x){sum(x==0)==0})]
+
+Big_Counts <- counts[valid_genes,] 
+Big_Counts_Norm <- sweep(Big_Counts, 2, Big_C[colnames(Big_Counts)], "/")
+Big_Group <- factor(group_info$Genotype)
+y_dge <- edgeR::DGEList(counts=Big_Counts, group=Big_Group)
+y_dge$offset <- matrix(log(Big_C), nrow=nrow(Big_Counts), ncol=ncol(Big_Counts), byrow=TRUE)
+y_dge <- edgeR::estimateDisp(y_dge, model.matrix(~0+Big_Group), robust=TRUE)
+global_phi <- y_dge$tagwise.dispersion
+
+
+
+
+n_genes <- nrow(Big_Counts)
+n_families <- nrow(hybrid_info)
+
+p_mat_rep <- matrix(NA, nrow=n_genes, ncol=n_families)
+colnames(p_mat_rep) <- hybrid_info$hybrid
+rownames(p_mat_rep) <- rownames(Big_Counts)
+
+for (fam in unique(hybrid_info$hybrid)) {
+  
+  # Get parent names
+  hi_fam <- hybrid_info[hybrid_info$hybrid == fam, , drop = FALSE]
+  female_geno <- hi_fam$female[1]
+  male_geno   <- hi_fam$male[1]
+
+  # Identify column names for this family
+  H_ids <- group_info$ID[group_info$Genotype == fam]
+  F_ids <- group_info$ID[group_info$Genotype == female_geno]
+  M_ids <- group_info$ID[group_info$Genotype == male_geno]
+  
+  # Skip if missing parents (Safety check)
+  if(length(F_ids) == 0 || length(M_ids) == 0) next 
+      
+  # Extract Data
+  y_f <- Big_Counts[, F_ids, drop=FALSE]
+  y_m <- Big_Counts[, M_ids, drop=FALSE]
+  y_h <- Big_Counts[, H_ids, drop=FALSE]
+  
+  c_f <- Big_C[F_ids]
+  c_m <- Big_C[M_ids]
+  c_h <- Big_C[H_ids]
+      
+  # Run Newton-Raphson LRT gene-by-gene
+  fam_pvals <- numeric(n_genes)
+  
+  # NOTE: Ensure test_Family_LRT is loaded in your environment
+  for(g in 1:n_genes) {
+      fam_pvals[g] <- test_Family_LRT(list(y_f[g,], y_m[g,], y_h[g,]), 
+                                      list(c_f, c_m, c_h), 
+                                      global_phi[g])
+  }
+  
+  p_mat_rep[, fam] <- fam_pvals
+}
+
+# Adjust FDR globally
+q_mat_rep <- apply(p_mat_rep, 2, function(x){p.adjust(x, method = "fdr")})
+```
+
+
+## 2. Apply two stage LRT to a single replicate 
+
+```{r perform 2sLRT on real data, eval = FALSE}
+twoStageLRT_app <- function(hybrid_info, raw_use, norm_use, norm_factors_use, gene_groups_no = 3, n_fam_thres = 2, alpha0 = 0.01){
+  ##### Step 1: Gene-wise pre-test - Poisson LRT for null-family ####
+  gene_test_func <- function(gene){
+  # compute pvalues from test using raw counts and norm factors
+    pval_family <- c()  # for Poisson LRT equal family
+    if(sd(gene) == 0){
+      # if this gene is equally expressed in all varieties
+      pval_family <- rep(1, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      pval_family[hb_num] <- Pois_3mean_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                            C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                            C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                            C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])
+      names(pval_family)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(pval_family = pval_family))
+}
+
+  gene_est_func <- function(gene){
+  # get MP, MPH ratio and diff MPH ratio from normalized data, i.e. estimation of mu_gi under global/Hg1
+    MP <- c()           # mid parents
+    hyb_ratio <- c()    # MPH ratio = hyb/MP
+    diff_ratio <- c()   # MPH diff ratio = (hyb-MP) / MP
+    family_mean <- c()  # family mean 
+    if(all(gene == 0)){
+      # if this gene is not expressed in all varieties
+      MP <- hyb_ratio <- diff_ratio <- family_mean <- rep(0, nrow(hybrid_info))
+    }
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      
+      MP[hb_num] <- mean(c(female, male))
+      family_mean[hb_num] <- mean(c(female, male, hybrid))
+      hyb_ratio[hb_num] <- hybrid/(MP[hb_num])
+      diff_ratio[hb_num] <- (hybrid - MP[hb_num]) / (MP[hb_num])
+      names(MP)[hb_num] <- names(family_mean) <- names(hyb_ratio)[hb_num] <- names(diff_ratio)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(list(MP = MP, family_mean = family_mean, hyb_ratio = hyb_ratio, diff_ratio = diff_ratio))
+  }
+  
+  test_result_list <- lapply(1:nrow(raw_use), function(i) gene_test_func(raw_use[i, ]))
+  est_result_list <- lapply(1:nrow(norm_use), function(i) gene_est_func(norm_use[i, ]))
+
+  
+  # combine genewise pre-test as a matrix, the order of results is consistent of hybrids in hybrid_info.
+  pval_family <- do.call(rbind, lapply(test_result_list, function(x) x$pval_family))
+  MP <- do.call(rbind, lapply(est_result_list, function(x) x$MP))
+  family_mean <- do.call(rbind, lapply(est_result_list, function(x) x$family_mean))
+  diff_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$diff_ratio))
+  hyb_ratio <- do.call(rbind, lapply(est_result_list, function(x) x$hyb_ratio))
+  rownames(pval_family) <- rownames(MP) <- rownames(hyb_ratio) <- rownames(diff_ratio) <- rownames(family_mean) <- rownames(raw_use)
+  colnames(pval_family) <- colnames(MP) <- colnames(hyb_ratio) <- colnames(diff_ratio) <- colnames(family_mean) <- hybrid_info$hybrid
+
+  qval_family <- apply(pval_family, 2, function(x){p.adjust(x, method = "fdr")})
+  
+
+##### Step 2: Estimate dispersion matrix ####
+  null_disp_ind <- qval_family > alpha0
+  DISP <- rep(NA, nrow(null_disp_ind)) # each gene will only have one dispersion estimation
+  names(DISP) <- rownames(null_disp_ind)
+  null_disp_ind_sub <- null_disp_ind[apply(null_disp_ind, 1, function(x) sum(x == 1)) >= n_fam_thres,]
+  jacc_dist <- dist(null_disp_ind_sub, "binary")
+  jacc_hc <- hclust(jacc_dist)
+  jacc_clust <- cutree(jacc_hc, gene_groups_no)
+  cat("Gene clusters size: \n")
+  print(table(jacc_clust))
+  for (i_clust in unique(jacc_clust)) {
+    genes_clust <- rownames(null_disp_ind_sub)[jacc_clust == i_clust]
+    ind_clust <- null_disp_ind_sub[genes_clust,]
+    worst_gene <- genes_clust[which.max(apply(ind_clust, 1, function(x) sum(x==0)))]
+    families_clust <- colnames(null_disp_ind_sub)[null_disp_ind_sub[worst_gene,] == 1]
+    cat(paste("Dispersion estimation for cluster", i_clust, "the number of families is", length(families_clust),", number of genes is ", length(genes_clust)," \n"))
+    counts_clust <- matrix(NA, nrow = length(genes_clust), ncol = 3 * length(families_clust))
+    for(n_hybrid in 1:length(families_clust)){
+      counts_clust[,(n_hybrid - 1) * 3 + 1] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"female"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 2] <- raw_use[genes_clust, hybrid_info[hybrid_info$hybrid == families_clust[n_hybrid],"male"]]
+      counts_clust[,(n_hybrid - 1) * 3 + 3] <- raw_use[genes_clust, families_clust[n_hybrid]]
+    }
+    group_clust <- rep(paste("G", 1:length(families_clust), sep = ""), each = 3)
+    DISP[genes_clust] <- Disp_est_null_family(counts = counts_clust, group = group_clust)
+  }
+  cat("Dispersion estimation summary:\n")
+  print(summary(DISP))
+  # #SS2: fit a loess curve to predict the dispersions for genes whose number of all-null families do not reach the minimal requirement all-null families
+    loess_x <- apply(MP, 1, median)
+    x <- loess_x[!is.na(DISP)]
+    y <- DISP[!is.na(DISP)]
+    if(sd(x) > 0){
+      new_x <- loess_x[is.na(DISP)]
+      loess_fit <- loess(log(y)~x, span = 0.01)
+      pred_disp <- exp(predict(loess_fit, newdata = new_x))
+      extra <- new_x[is.na(pred_disp) | pred_disp <= 0]
+      intra <- new_x[!is.na(pred_disp) & pred_disp > 0 ]
+      intra_disp <- pred_disp[!is.na(pred_disp) & pred_disp > 0 ]
+      extra_disp <- ifelse(extra < min(x), y[which.min(x)], y[which.max(x)])
+      pred_disp[is.na(pred_disp) | pred_disp <= 0] <- extra_disp
+      DISP[is.na(DISP)] <- pred_disp
+      }
+    dispersion_mat <- matrix(DISP, nrow = nrow(raw_use), ncol = nrow(hybrid_info))
+    colnames(dispersion_mat) <- hybrid_info$hybrid
+    rownames(dispersion_mat) <- rownames(raw_use)
+##### Step 3: NB estimation with known dispersion matrix ####
+  NB_gene_func <- function(gene_ind){
+    gene <- raw_use[gene_ind,]
+    gene_name <- rownames(raw_use)[gene_ind]
+    pval <- c()
+    if(sd(gene) == 0){pval <- rep(1, nrow(hybrid_info))}
+    for(hb_num in 1:nrow(hybrid_info)){
+      female <- as.numeric(gene[hybrid_info$female[hb_num]])
+      male <- as.numeric(gene[hybrid_info$male[hb_num]])
+      hybrid <- as.numeric(gene[hybrid_info$hybrid[hb_num]])
+      dispersion <- dispersion_mat[gene_name, hybrid_info$hybrid[hb_num]]
+      if(dispersion == 0){pval[hb_num] <- Hetero_Pois_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                                          C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                                          C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                                          C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]])}
+      else{pval[hb_num] <- Hetero_NB_LRT(y_g1 = female, y_g2 = male, y_g3 = hybrid,
+                                         C_1 = norm_factors_use[hybrid_info$female[hb_num]],
+                                         C_2 = norm_factors_use[hybrid_info$male[hb_num]],
+                                         C_3 = norm_factors_use[hybrid_info$hybrid[hb_num]],
+                                         dispersion = dispersion)}
+      names(pval)[hb_num] <- hybrid_info$hybrid[hb_num]
+    }
+    return(pval)
+  }
+  
+  pval_NB <- do.call(rbind, lapply(1:nrow(raw_use),  NB_gene_func))
+  rownames(pval_NB) <- rownames(raw_use)
+  qval_NB <- apply(pval_NB, 2, function(x){p.adjust(x, method = "fdr")})
+  return(list(pval_NB = pval_NB, qval_NB = qval_NB))
+}
+evaluate_performance <- function(pred_p, pred_q, truth_p, truth_q, label, significance = 0.05) {
+  # 1. Flatten vectors
+  pv_pred <- as.vector(pred_p)
+  pv_rep  <- as.vector(truth_p)
+  q_pred  <- as.vector(pred_q)
+  q_rep   <- as.vector(truth_q)
+  
+  # 2. Filter Finite values
+  keep <- is.finite(pv_pred) & is.finite(pv_rep) & 
+          is.finite(q_pred)  & is.finite(q_rep)
+  
+  pv_pred <- pv_pred[keep]; pv_rep <- pv_rep[keep]
+  q_pred  <- q_pred[keep];  q_rep  <- q_rep[keep]
+  
+  # 3. Define Truth (Significance Threshold < 0.05)
+  is_true   <- q_rep  < 0.05
+  is_called <- q_pred < 0.05
+  
+  # 4. Counts
+  TP <- sum(is_called & is_true)
+  FP <- sum(is_called & !is_true)
+  FN <- sum(!is_called & is_true)
+  n_true <- sum(is_true)
+  
+  # 5. Metrics
+  precision <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, NA, TP / (TP + FN))
+  
+  # 6. AUC (Direction: q-values, so smaller = positive, thus direction = ">")
+  auc_full <- NA
+  auc_part <- NA
+  
+  if (length(unique(is_true)) == 2) {
+    roc_obj <- roc(response = is_true, predictor = q_pred, direction = ">", quiet = TRUE)
+    auc_full <- as.numeric(auc(roc_obj))
+    # pAUC (FPR < 0.2)
+    auc_part <- as.numeric(auc(roc_obj, partial.auc = c(1, 0.8), 
+                               partial.auc.focus = "specificity", 
+                               partial.auc.correct = TRUE))
+  }
+  
+  # 7. CCC (on -log10 p-values)
+  # Use pmax to avoid log(0) = -Inf
+  log_pred <- -log10(pmax(pv_pred, .Machine$double.xmin))
+  log_rep  <- -log10(pmax(pv_rep, .Machine$double.xmin))
+  ccc_res  <- CCC(log_pred, log_rep)
+  
+  # 8. Top 1000 Overlap
+  k <- min(1000, length(q_pred))
+  top_overlap <- length(intersect(order(q_pred)[1:k], order(q_rep)[1:k]))
+  
+  # Return one-row data frame
+  return(data.frame(
+    Replicate_ID    = label,
+    True_Positives  = TP,
+    False_Positives = FP,
+    Precision       = precision,
+    Recall          = recall,
+    AUC             = auc_full,
+    pAUC_0.2        = auc_part,
+    CCC_LogP        = ccc_res$rho.c$est,
+    Top1k_Overlap   = top_overlap,
+    stringsAsFactors = FALSE
+  ))
+}
+```
+
+
+```{r}
+# ==============================================================================
+# 1. SETUP PARAMETERS
+# ==============================================================================
+n_iterations <- 10  # How many times to repeat the random split
+significance <- 0.05
+results_list <- list()
+
+set.seed(123) # Optional: set seed for reproducibility of the whole sequence
+
+# ==============================================================================
+# 2. ITERATION LOOP
+# ==============================================================================
+for (i in 1:n_iterations) {
+  
+  message(paste("Running Iteration:", i, "/", n_iterations))
+  
+  split_info <- group_info %>%
+    group_by(Genotype) %>%
+    mutate(Split_Label = sample(c(1, 2), size = n(), replace = FALSE)) %>%
+    ungroup()
+  
+  rep1_info <- split_info %>% filter(Split_Label == 1)
+  rep2_info <- split_info %>% filter(Split_Label == 2)
+  
+  # --------------------------------------------------------------------------
+  # 2. Analyze & Evaluate REPLICATE 1
+  # --------------------------------------------------------------------------
+  # A. Run Analysis
+  rep_sel <- rep1_info 
+  sample_srep <- rep_sel$ID
+  raw_use <- Big_Counts[,sample_srep]
+  colnames(raw_use) <- rep_sel$Genotype
+  norm_use <- Big_Counts_Norm[,sample_srep]
+  colnames(norm_use) <- rep_sel$Genotype
+  norm_factors_use <- Big_C[sample_srep]
+  names(norm_factors_use) <- rep_sel$Genotype
+  res1 <- twoStageLRT_app(hybrid_info = hybrid_info, raw_use = raw_use,
+                          norm_use = norm_use, norm_factors_use = norm_factors_use,
+                           gene_groups_no = 3, n_fam_thres = 2, alpha0 = 0.01)
+  
+  # B. Evaluate (Compare against Ground Truth)
+  eval1 <- evaluate_performance(pred_p  = res1$pval_NB, 
+                                pred_q  = res1$qval_NB, 
+                                truth_p = p_mat_rep, # Ground Truth P
+                                truth_q = q_mat_rep, # Ground Truth Q
+                                label   = paste0("Iter", i, "Rep1"),
+                                significance = 0.05)
+  eval1$Iteration <- i
+  
+  # --------------------------------------------------------------------------
+  # 3. Analyze & Evaluate REPLICATE 2
+  # --------------------------------------------------------------------------
+  # A. Run Analysis
+  rep_sel <- rep2_info 
+  sample_srep <- rep_sel$ID
+  raw_use <- Big_Counts[,sample_srep]
+  colnames(raw_use) <- rep_sel$Genotype
+  norm_use <- Big_Counts_Norm[,sample_srep]
+  colnames(norm_use) <- rep_sel$Genotype
+  norm_factors_use <- Big_C[sample_srep]
+  names(norm_factors_use) <- rep_sel$Genotype
+  res2 <- twoStageLRT_app(hybrid_info = hybrid_info, raw_use = raw_use,
+                          norm_use = norm_use, norm_factors_use = norm_factors_use,
+                           gene_groups_no = 3, n_fam_thres = 2, alpha0 = 0.01)
+  
+  # B. Evaluate
+  eval2 <- evaluate_performance(pred_p  = res2$pval_NB, 
+                                pred_q  = res2$qval_NB, 
+                                truth_p = p_mat_rep, 
+                                truth_q = q_mat_rep, 
+                                label   = paste0("Iter", i, "Rep2"),
+                                significance = 0.05)
+  eval2$Iteration <- i
+  
+  # --------------------------------------------------------------------------
+  # 4. Store Results
+  # --------------------------------------------------------------------------
+  results_list[[i]] <- rbind(eval1, eval2)
+}
+
+# Combine all results
+final_results_df <- do.call(rbind, results_list)
+
+# View
+print(head(final_results_df))
+
+# Summary Statistics
+summary_stats <- final_results_df %>%
+  group_by(Replicate_ID) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm=T),
+    Mean_CCC = mean(CCC_LogP, na.rm=T),
+    Mean_Precision = mean(Precision, na.rm=T)
+  )
+
+print(summary_stats)
+```
+
