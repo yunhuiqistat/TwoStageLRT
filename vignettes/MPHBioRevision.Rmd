@@ -523,7 +523,7 @@ For each independent replicate run, we first subsetted the raw count matrix to i
 # ------------------------------------------------------------------------------
 # Isolate single replicate samples from your raw counts and metadata
 # 'target_idx' contains sample names for hybrids in this replicate with its parents are in the same batch and system
-rep_selected <- "1"
+rep_selected <- "3"
 meta_family_rep <- meta_family[meta_family$Replicate == rep_selected, ]
 hybrid_info <- data.frame(hybrid = meta_family_rep$Hybrid_Sample,
                           female = meta_family_rep$Parent1_Samples_Single,
@@ -638,8 +638,8 @@ names(norm_factors_use) <- rownames(dge_rep_clean$samples)
 ##### Step 2: Estimate dispersion matrix ####
   # values of tuning parameters
   gene_groups_no = 1     # number of clusters
-  n_fam_thres = 15       # number of null families threshold for dispersion estimation
-  alpha0 <- 0.1
+  n_fam_thres = 12       # number of null families threshold for dispersion estimation
+  alpha0 <- 0.01
 
   null_disp_ind <- qval_family > alpha0
   DISP <- rep(NA, nrow(null_disp_ind)) # each gene will only have one dispersion estimation
@@ -1165,10 +1165,18 @@ get_performance_metrics <- function(df, stage_name) {
       roc(response = truth_labels, predictor = pred_scores, quiet = TRUE, direction = "<")
     }, error = function(e) return(NULL))
     
+    print(plot(roc_obj))
+    
     if(!is.null(roc_obj)) {
       auc_val <- as.numeric(roc_obj$auc)
     }
   }
+  
+  roc_df <- data.frame(
+  FPR = 1 - roc_obj$specificities,
+  TPR = roc_obj$sensitivities,
+  threshold = roc_obj$thresholds
+  )
   
   # 4. TOP 10000 OVERLAP
   valid_cor$UniqueID <- paste0(valid_cor$Gene, "_", valid_cor$Hybrid)
@@ -1179,7 +1187,8 @@ get_performance_metrics <- function(df, stage_name) {
   
   top_overlap <- length(intersect(my_top_ids, their_top_ids)) / top_n
   
-  return(data.frame(
+  return(list(roc_df = roc_df, eval_df = 
+    data.frame(
     Stage       = stage_name,
     N_Pairs     = nrow(df),
     Precision   = round(precision * 100, 1),
@@ -1188,7 +1197,7 @@ get_performance_metrics <- function(df, stage_name) {
     Spearman    = round(spearman, 3),
     CCC_LogP    = round(ccc_val, 3),
     Top10000_Ovrl = round(top_overlap * 100, 1)
-  ))
+  )))
 }
 ```
 
@@ -1196,7 +1205,7 @@ get_performance_metrics <- function(df, stage_name) {
 
 ```{r}
 # ==============================================================================
-# PHASE 1: FIND THE BEST REPLICATE (Correct FDR Order)
+# PHASE 1: FIND THE BEST REPLICATE FOR MULTIPLE MATCH (Correct FDR Order)
 # ==============================================================================
 
 # 1. Start with FULL Raw P-value Matrices
@@ -1209,7 +1218,7 @@ fdr_theirs_full <- apply(raw_theirs_full, 2, p.adjust, method = "BH")
 
 # 3. NOW Intersect Genes (Subset the FDR matrices, not the P-value matrices)
 common_genes <- intersect(rownames(fdr_mine_full), rownames(fdr_theirs_full))
-common_genes <- intersect(common_genes, names(y))
+# common_genes <- intersect(common_genes, names(y))
 
 # Subset the FDR matrices
 fdr_mine_sub   <- fdr_mine_full[common_genes, ]
@@ -1287,7 +1296,7 @@ all_diag_list <- lapply(colnames(fdr_mine_clean), function(target_family) {
       fdr_mine_full   = fdr_mine_input, 
       fdr_theirs_full = fdr_theirs_clean,
       common_genes    = common_genes,
-      alpha = 0.1
+      alpha = 0.05
     )
   }, error = function(e) { warning(e); return(NULL) })
 })
@@ -1308,27 +1317,60 @@ r6 <- get_performance_metrics(subset(master_diagnosis_df, Is_Signal_Correct), "6
 r7 <- get_performance_metrics(subset(master_diagnosis_df, Is_Count_Close), "7. Remove Not Similar Counts")
 
 
-final_table <- rbind(r1, r2, r3, r4, r5, r6, r7)
+final_table <- rbind(r1$eval_df, r2$eval_df, r3$eval_df, r4$eval_df, r5$eval_df, r6$eval_df, r7$eval_df)
 final_table$Data_Remaining_Pct <- round(final_table$N_Pairs / nrow(master_diagnosis_df) * 100, 1)
 
 print(final_table)
 ```
+
 
 ```{r}
-r1 <- get_performance_metrics(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), "1. Raw Output")
-r2 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Quantifiable), "2. Remove low count (min<10)")
-r3 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Quantifiable_Strong), "3. Remove low count and weak signal(absmph<0.3) ")
-r4 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Representative), "4. Remove low count and weak signal and noisy(cv>0.5)")
-r5 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Disp_Correct), "5. Remove Disp Error")
-r6 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Signal_Correct), "6. Remove Outliers")
-r7 <- get_performance_metrics(subset(master_diagnosis_df %>% subset(Is_Rep_Confidenct == TRUE), Is_Count_Close), "7. Remove Not Similar Counts")
+load("Pitz_Results.RData")
+## 1. Bind ROC curves into one long data frame
+# roc_df is a list: $rep1, $rep2, $rep3
+roc_long <- imap_dfr(
+  roc_df,
+  ~ mutate(.x, replicate = .y)  # .y is "rep1", "rep2", "rep3"
+)
+# ensure order rep1, rep2, rep3
+roc_long$replicate <- factor(roc_long$replicate, levels = c("rep1", "rep2", "rep3"))
 
+## 2. Extract AUCs from eval_df
+# eval_df is a list: $rep1, $rep2, $rep3 each with column AUC
+auc_df <- imap_dfr(
+  eval_df,
+  ~ data.frame(replicate = .y, AUC = .x$AUC)
+)
 
-final_table <- rbind(r1, r2, r3, r4, r5, r6, r7)
-final_table$Data_Remaining_Pct <- round(final_table$N_Pairs / nrow(master_diagnosis_df) * 100, 1)
+## 3. Join AUC into ROC data
+roc_long2 <- roc_long %>%
+  left_join(auc_df, by = "replicate") %>%
+  mutate(rep_auc = paste0(replicate, " (AUC = ", round(AUC, 2), ")"))
 
-print(final_table)
+## 4a. Plot: three ROC curves on one plot, color by replicate + AUC in legend
+p_roc_pitz <- ggplot(roc_long2, aes(x = FPR, y = TPR, color = rep_auc)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50") +
+  coord_equal() +
+  labs(
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Replicate",
+    title = ""
+  ) +
+  theme(legend.position = "bottom")
+  theme_bw()
+  
+ggsave(
+  filename = "ROC_pitz.png",
+  plot     = p_roc_pitz,
+  width    = 6,      # in inches
+  height   = 6,
+  dpi      = 300
+)
 ```
+
 
 
 # Comparison using in house replicated dataset
@@ -1337,7 +1379,6 @@ We drop sample B18.2nd, and B21.2nd to make sure we have two replicates per geno
 
 
 ```{r}
-
 logLik_NB <- function(y, C, mu, r) { sum(y * log(C * mu) - (y + r) * log(C * mu + r)) }
 score_NB  <- function(y, C, mu, r) { sum( (y / mu) - ((y + r) * C) / (C * mu + r) ) }
 hessian_NB<- function(y, C, mu, r) { sum( -(y / mu^2) + ((y + r) * C^2) / (C * mu + r)^2 ) }
@@ -1681,6 +1722,11 @@ evaluate_performance <- function(pred_p, pred_q, truth_p, truth_q, label, signif
                                partial.auc.focus = "specificity", 
                                partial.auc.correct = TRUE))
   }
+  roc_df <- data.frame(
+  FPR = 1 - roc_obj$specificities,
+  TPR = roc_obj$sensitivities,
+  threshold = roc_obj$thresholds
+  )
   
   # 7. CCC (on -log10 p-values)
   # Use pmax to avoid log(0) = -Inf
@@ -1693,7 +1739,7 @@ evaluate_performance <- function(pred_p, pred_q, truth_p, truth_q, label, signif
   top_overlap <- length(intersect(order(q_pred)[1:k], order(q_rep)[1:k]))
   
   # Return one-row data frame
-  return(data.frame(
+  return(list(roc_df=roc_df, eval_df = data.frame(
     Replicate_ID    = label,
     True_Positives  = TP,
     False_Positives = FP,
@@ -1704,7 +1750,7 @@ evaluate_performance <- function(pred_p, pred_q, truth_p, truth_q, label, signif
     CCC_LogP        = ccc_res$rho.c$est,
     Top1k_Overlap   = top_overlap,
     stringsAsFactors = FALSE
-  ))
+  )))
 }
 ```
 
@@ -1716,6 +1762,7 @@ evaluate_performance <- function(pred_p, pred_q, truth_p, truth_q, label, signif
 n_iterations <- 10  # How many times to repeat the random split
 significance <- 0.05
 results_list <- list()
+roc_list <- list()
 
 set.seed(123) # Optional: set seed for reproducibility of the whole sequence
 
@@ -1751,12 +1798,14 @@ for (i in 1:n_iterations) {
                            gene_groups_no = 3, n_fam_thres = 2, alpha0 = 0.01)
   
   # B. Evaluate (Compare against Ground Truth)
-  eval1 <- evaluate_performance(pred_p  = res1$pval_NB, 
+  ev_res1 <- evaluate_performance(pred_p  = res1$pval_NB, 
                                 pred_q  = res1$qval_NB, 
                                 truth_p = p_mat_rep, # Ground Truth P
                                 truth_q = q_mat_rep, # Ground Truth Q
                                 label   = paste0("Iter", i, "Rep1"),
                                 significance = 0.05)
+  roc_list <- append(roc_list, list(ev_res1$roc_df))
+  eval1 <- ev_res1$eval_df
   eval1$Iteration <- i
   
   # --------------------------------------------------------------------------
@@ -1776,12 +1825,14 @@ for (i in 1:n_iterations) {
                            gene_groups_no = 3, n_fam_thres = 2, alpha0 = 0.01)
   
   # B. Evaluate
-  eval2 <- evaluate_performance(pred_p  = res2$pval_NB, 
+  ev_res2 <- evaluate_performance(pred_p  = res2$pval_NB, 
                                 pred_q  = res2$qval_NB, 
                                 truth_p = p_mat_rep, 
                                 truth_q = q_mat_rep, 
                                 label   = paste0("Iter", i, "Rep2"),
                                 significance = 0.05)
+  roc_list <- append(roc_list, list(ev_res2$roc_df))
+  eval2 <- ev_res2$eval_df
   eval2$Iteration <- i
   
   # --------------------------------------------------------------------------
@@ -1794,17 +1845,56 @@ for (i in 1:n_iterations) {
 final_results_df <- do.call(rbind, results_list)
 
 # View
-print(head(final_results_df))
+summary(final_results_df$AUC)
 
-# Summary Statistics
-summary_stats <- final_results_df %>%
-  group_by(Replicate_ID) %>%
-  summarise(
-    Mean_AUC = mean(AUC, na.rm=T),
-    Mean_CCC = mean(CCC_LogP, na.rm=T),
-    Mean_Precision = mean(Precision, na.rm=T)
-  )
 
-print(summary_stats)
+```
+
+
+```{r}
+load("Inhouse_Results.RData")
+roc_long <- imap_dfr(
+  roc_list,
+  ~ {
+    idx  <- .y                     # 1,2,3,...
+    iter <- ceiling(idx / 2)       # 1,1,2,2,3,3,...
+    rep  <- ifelse(idx %% 2 == 1, "rep1", "rep2")  # odd = rep1, even = rep2
+
+    mutate(
+      .x,
+      curve_id = paste0("iter", iter, "_", rep)
+    )
+  }
+)
+
+roc_long$curve_id <- factor(roc_long$curve_id, levels = unique(roc_long$curve_id))
+
+
+p_roc_inhouse <- ggplot(roc_long, aes(x = FPR, y = TPR, group = curve_id)) +
+  geom_line(linewidth = 0.2, alpha = 0.9, show.legend = FALSE, color = "gray30") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50") +
+  coord_equal() +
+  labs(
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)") 
+
+  
+ggsave(
+  filename = "ROC_inhouse.png",
+  plot     = p_roc_inhouse,
+  width    = 6,      # in inches
+  height   = 6,
+  dpi      = 300
+)
+
+
+ggsave(
+  filename = "ROC_rep.png",
+  plot     = ggarrange(p_roc_pitz, p_roc_inhouse, nrow=1, align = "h"),
+  width    = 12,      # in inches
+  height   = 6,
+  dpi      = 300
+)
 ```
 
