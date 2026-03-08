@@ -1879,10 +1879,27 @@ p_roc_inhouse <- ggplot(roc_long, aes(x = FPR, y = TPR, group = curve_id)) +
     x = "False Positive Rate (1 - Specificity)",
     y = "True Positive Rate (Sensitivity)") 
 
+p_roc_inhouse_median <- ggplot(roc_long[roc_long$curve_id == "iter3_rep1",], aes(x = FPR, y = TPR)) +
+  geom_line(linewidth = 1, alpha = 0.9, show.legend = FALSE, color = "gray30") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50") +
+  coord_equal() +
+  labs(
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)") 
+
   
 ggsave(
   filename = "ROC_inhouse.png",
   plot     = p_roc_inhouse,
+  width    = 6,      # in inches
+  height   = 6,
+  dpi      = 300
+)
+
+ggsave(
+  filename = "ROC_inhouse_median.png",
+  plot     = p_roc_inhouse_median,
   width    = 6,      # in inches
   height   = 6,
   dpi      = 300
@@ -1896,5 +1913,14 @@ ggsave(
   height   = 6,
   dpi      = 300
 )
+
+ggsave(
+  filename = "ROC_rep_median.png",
+  plot     = ggarrange(p_roc_pitz, p_roc_inhouse_median, nrow=1, align = "h"),
+  width    = 12,      # in inches
+  height   = 6,
+  dpi      = 300
+)
+
 ```
 
